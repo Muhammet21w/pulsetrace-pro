@@ -1,950 +1,610 @@
+'use strict';
+
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'pulsetrace_super_secure_enterprise_secret_2026';
+const PORT = Number(process.env.PORT || 3000);
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const JWT_SECRET = process.env.JWT_SECRET;
 
-app.use(cors());
-app.use(express.json());
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    if (IS_PRODUCTION) {
+        console.error('FATAL: Production ortamında en az 32 karakterlik JWT_SECRET zorunludur.');
+        process.exit(1);
+    }
+    console.warn('UYARI: JWT_SECRET ayarlanmamış veya kısa. Yerel test için geçici anahtar kullanılıyor. Canlıya çıkmadan önce .env içine güçlü JWT_SECRET ekleyin.');
+}
 
-// SQLite Veritabanı ve Foreign Key Aktifleştirme
-const db = new Database('pulsetrace_enterprise.db');
+const SIGNING_SECRET = JWT_SECRET || crypto.randomBytes(48).toString('hex');
+const DB_PATH = path.join(__dirname, 'pulsetrace_enterprise.db');
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+db.pragma('busy_timeout = 5000');
 
-db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        plan_type TEXT DEFAULT 'free',
-        monthly_error_count INTEGER DEFAULT 0,
-        error_limit INTEGER DEFAULT 3000,
-        role TEXT DEFAULT 'user',
-        trial_ends_at DATETIME,
-        reset_code TEXT,
-        reset_code_expires DATETIME,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Geçici OTP Doğrulama Tablosu
-    CREATE TABLE IF NOT EXISTS pending_registrations (
-        email TEXT PRIMARY KEY,
-        password_hash TEXT NOT NULL,
-        otp_code TEXT NOT NULL,
-        expires_at DATETIME NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS projects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        name TEXT NOT NULL,
-        api_key_hash TEXT UNIQUE NOT NULL,
-        api_key_prefix TEXT NOT NULL,
-        status TEXT DEFAULT 'Aktif',
-        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS errors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id INTEGER,
-        level TEXT,
-        status TEXT DEFAULT 'Aktif',
-        message TEXT,
-        stack TEXT,
-        url TEXT,
-        ip TEXT,
-        browser TEXT,
-        fingerprint TEXT,
-        count INTEGER DEFAULT 1,
-        affected_users INTEGER DEFAULT 1,
-        first_seen TEXT,
-        last_seen TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS error_clients (
-        error_id INTEGER,
-        client_uuid TEXT,
-        PRIMARY KEY(error_id, client_uuid),
-        FOREIGN KEY(error_id) REFERENCES errors(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS payment_notifications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        plan TEXT,
-        amount TEXT,
-        method TEXT,
-        note TEXT,
-        status TEXT DEFAULT 'Bekliyor',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-`);
-
-// Brevo SMTP Aktarıcısı
-const transporter = nodemailer.createTransport({
-    host: 'smtp-relay.brevo.com',
-    port: 587,
-    auth: {
-        user: process.env.BREVO_USER,
-        pass: process.env.BREVO_SMTP_KEY
-    }
-});
-
-function verifyJwtSession(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ success: false, message: "Oturum token'ı bulunamadı." });
-    }
-
-    const token = authHeader.split(' ')[1];
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const user = db.prepare('SELECT id, email, plan_type, monthly_error_count, error_limit, role, trial_ends_at FROM users WHERE id = ?').get(decoded.userId);
-        if (!user) return res.status(401).json({ success: false, message: "Geçersiz oturum kullanıcısı." });
-        
-        req.user = user;
-        next();
-    } catch (err) {
-        return res.status(403).json({ success: false, message: "Oturum süresi doldu veya geçersiz token." });
+function addColumnIfMissing(table, column, definition) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!columns.some(c => c.name === column)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
 }
 
-// 1. AŞAMA: Kayıt Talebi ve E-postaya OTP Kodu Gönderme
-app.post('/api/auth/register', async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ success: false, message: "E-posta ve şifre zorunludur." });
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    plan_type TEXT DEFAULT 'free',
+    monthly_error_count INTEGER DEFAULT 0,
+    error_limit INTEGER DEFAULT 3000,
+    role TEXT DEFAULT 'user',
+    trial_ends_at TEXT,
+    reset_code TEXT,
+    reset_code_expires TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS pending_registrations (
+    email TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    otp_code TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    name TEXT NOT NULL,
+    api_key_hash TEXT UNIQUE NOT NULL,
+    api_key_prefix TEXT NOT NULL,
+    status TEXT DEFAULT 'Aktif',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER,
+    level TEXT,
+    status TEXT DEFAULT 'Aktif',
+    message TEXT,
+    stack TEXT,
+    url TEXT,
+    ip TEXT,
+    browser TEXT,
+    fingerprint TEXT,
+    count INTEGER DEFAULT 1,
+    affected_users INTEGER DEFAULT 0,
+    first_seen TEXT,
+    last_seen TEXT,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS error_clients (
+    error_id INTEGER,
+    client_uuid TEXT,
+    PRIMARY KEY(error_id, client_uuid),
+    FOREIGN KEY(error_id) REFERENCES errors(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS payment_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    plan TEXT,
+    amount TEXT,
+    method TEXT,
+    note TEXT,
+    status TEXT DEFAULT 'Bekliyor',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+`);
 
-    if (password.length < 6) {
-        return res.status(400).json({ success: false, message: "Şifre en az 6 karakter uzunluğunda olmalıdır!" });
-    }
+addColumnIfMissing('users', 'usage_month', 'TEXT');
+addColumnIfMissing('users', 'token_version', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('pending_registrations', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('pending_registrations', 'updated_at', 'TEXT');
+addColumnIfMissing('projects', 'revoked_at', 'TEXT');
+addColumnIfMissing('errors', 'environment', 'TEXT');
+addColumnIfMissing('errors', 'release', 'TEXT');
 
-    const existingUser = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (existingUser) {
-        return res.status(400).json({ success: false, message: "Bu e-posta adresi zaten kullanımda." });
-    }
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_errors_project_last_seen ON errors(project_id, last_seen);
+CREATE INDEX IF NOT EXISTS idx_errors_fingerprint ON errors(project_id, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_error_clients_client ON error_clients(client_uuid);
+`);
 
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (IS_PRODUCTION) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
+});
+
+app.use(cors({
+    origin(origin, callback) {
+        // Aynı origin isteklerinde Origin olmayabilir. CORS_ORIGINS boşsa
+        // cross-origin tarayıcı erişimi kapalı tutulur.
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error('CORS origin not allowed'));
+    },
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+}));
+app.use(express.json({ limit: '256kb' }));
+
+const rateBuckets = new Map();
+function rateLimit({ windowMs = 60000, max = 30, keyFn = req => req.ip } = {}) {
+    return (req, res, next) => {
+        const now = Date.now();
+        const key = `${req.path}:${keyFn(req)}`;
+        let item = rateBuckets.get(key);
+        if (!item || item.resetAt <= now) item = { count: 0, resetAt: now + windowMs };
+        item.count += 1;
+        rateBuckets.set(key, item);
+        if (item.count > max) {
+            res.setHeader('Retry-After', Math.ceil((item.resetAt - now) / 1000));
+            return res.status(429).json({ success: false, message: 'Çok fazla istek gönderildi. Lütfen biraz bekleyin.' });
+        }
+        next();
+    };
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, value] of rateBuckets) if (value.resetAt <= now) rateBuckets.delete(key);
+}, 60000).unref();
+
+function cleanEmail(value) {
+    return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+function validEmail(email) {
+    return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+function safeString(value, max = 4000) {
+    return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+function sha256(value) {
+    return crypto.createHash('sha256').update(value).digest('hex');
+}
+function otpHash(email, code, purpose) {
+    return crypto.createHmac('sha256', SIGNING_SECRET).update(`${purpose}:${email}:${code}`).digest('hex');
+}
+function safeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const aa = Buffer.from(a);
+    const bb = Buffer.from(b);
+    return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+function generateOtp() {
+    return crypto.randomInt(100000, 1000000).toString();
+}
+function createApiKey() {
+    return `pt_live_${crypto.randomBytes(32).toString('hex')}`;
+}
+function sendError(res, status, message) {
+    return res.status(status).json({ success: false, message });
+}
+
+let transporter = null;
+if (process.env.BREVO_USER && process.env.BREVO_SMTP_KEY) {
+    transporter = nodemailer.createTransport({
+        host: process.env.BREVO_SMTP_HOST || 'smtp-relay.brevo.com',
+        port: Number(process.env.BREVO_SMTP_PORT || 587),
+        secure: false,
+        auth: { user: process.env.BREVO_USER, pass: process.env.BREVO_SMTP_KEY }
+    });
+}
+
+async function sendMail({ to, subject, text }) {
+    if (!transporter) throw new Error('SMTP yapılandırması eksik. .env içinde BREVO_USER ve BREVO_SMTP_KEY ayarlanmalı.');
+    await transporter.sendMail({
+        from: process.env.MAIL_FROM || '"PulseTrace Pro" <noreply@pulsetrace.com>',
+        to, subject, text
+    });
+}
+
+function verifyJwtSession(req, res, next) {
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) return sendError(res, 401, 'Oturum tokenı bulunamadı.');
     try {
-        const saltRounds = 12;
-        const passwordHash = await bcrypt.hash(password, saltRounds);
+        const decoded = jwt.verify(authHeader.slice(7), SIGNING_SECRET);
+        const user = db.prepare(`
+            SELECT id, email, plan_type, monthly_error_count, error_limit, role, trial_ends_at, token_version
+            FROM users WHERE id = ?
+        `).get(decoded.userId);
+        if (!user || Number(decoded.tokenVersion || 0) !== Number(user.token_version || 0)) {
+            return sendError(res, 401, 'Oturum geçersiz. Lütfen tekrar giriş yapın.');
+        }
+        req.user = user;
+        next();
+    } catch {
+        return sendError(res, 401, 'Oturum süresi doldu veya geçersiz token.');
+    }
+}
 
-        db.prepare(`
-            INSERT OR REPLACE INTO pending_registrations (email, password_hash, otp_code, expires_at) 
-            VALUES (?, ?, ?, ?)
-        `).run(email, passwordHash, otpCode, expiresAt);
+function issueToken(user) {
+    return jwt.sign(
+        { userId: user.id, email: user.email, tokenVersion: Number(user.token_version || 0) },
+        SIGNING_SECRET,
+        { expiresIn: '7d', issuer: 'pulsetrace-pro' }
+    );
+}
 
-        await transporter.sendMail({
-            from: '"PulseTrace Pro" <noreply@pulsetrace.com>',
-            to: email,
-            subject: 'PulseTrace Pro - Hesap Doğrulama Kodunuz',
-            text: `Merhaba, PulseTrace Pro kayıt işleminizi tamamlamak için doğrulama kodunuz: ${otpCode}. Bu kod 5 dakika geçerlidir.`
-        });
+function resetMonthlyUsage(userId) {
+    const month = new Date().toISOString().slice(0, 7);
+    db.prepare(`
+        UPDATE users SET monthly_error_count = 0, usage_month = ?
+        WHERE id = ? AND (usage_month IS NULL OR usage_month <> ?)
+    `).run(month, userId, month);
+}
 
-        res.json({ success: true, message: "Doğrulama kodu e-posta adresinize gönderildi. Lütfen kodu girin." });
-    } catch (err) {
-        console.error("Kayıt ve E-posta Gönderme Hatası:", err);
-        res.status(500).json({ success: false, message: "E-posta gönderilemedi. Lütfen Brevo SMTP ayarlarını kontrol edin." });
+app.get('/api/health', (req, res) => {
+    try {
+        db.prepare('SELECT 1').get();
+        res.json({ success: true, status: 'ok', timestamp: new Date().toISOString() });
+    } catch {
+        sendError(res, 503, 'Veritabanı sağlık kontrolü başarısız.');
     }
 });
 
-// 2. AŞAMA: OTP Kodunu Doğrulama ve Hesabı Açma
-app.post('/api/auth/verify-otp', async (req, res) => {
-    const { email, code } = req.body;
-    if (!email || !code) {
-        return res.status(400).json({ success: false, message: "E-posta ve doğrulama kodu gereklidir." });
+// Kayıt ve e-posta OTP
+app.post('/api/auth/register', rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }), async (req, res) => {
+    const email = cleanEmail(req.body?.email);
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!validEmail(email) || password.length < 10 || password.length > 128) {
+        return sendError(res, 400, 'Geçerli e-posta girin. Şifre 10-128 karakter olmalıdır.');
     }
+    if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
+        return sendError(res, 409, 'Bu e-posta adresi zaten kullanımda.');
+    }
+
+    const code = generateOtp();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    try {
+        const passwordHash = await bcrypt.hash(password, 12);
+        db.prepare(`
+            INSERT INTO pending_registrations (email, password_hash, otp_code, expires_at, attempts, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                otp_code = excluded.otp_code,
+                expires_at = excluded.expires_at,
+                attempts = 0,
+                updated_at = excluded.updated_at
+        `).run(email, passwordHash, otpHash(email, code, 'register'), expiresAt, new Date().toISOString());
+
+        await sendMail({
+            to: email,
+            subject: 'PulseTrace Pro - Hesap doğrulama kodunuz',
+            text: `PulseTrace Pro kayıt doğrulama kodunuz: ${code}. Kod 5 dakika geçerlidir.`
+        });
+        res.json({ success: true, message: 'Doğrulama kodu e-posta adresinize gönderildi.' });
+    } catch (err) {
+        console.error('Register/mail error:', err.message);
+        db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
+        sendError(res, 503, 'E-posta gönderilemedi. SMTP ayarlarını kontrol edin.');
+    }
+});
+
+app.post('/api/auth/verify-otp', rateLimit({ max: 10, windowMs: 10 * 60 * 1000 }), (req, res) => {
+    const email = cleanEmail(req.body?.email);
+    const code = safeString(req.body?.code, 6);
+    if (!validEmail(email) || !/^\d{6}$/.test(code)) return sendError(res, 400, 'E-posta ve 6 haneli kod gereklidir.');
 
     const pending = db.prepare('SELECT * FROM pending_registrations WHERE email = ?').get(email);
-    if (!pending) {
-        return res.status(400).json({ success: false, message: "Bu e-posta için kayıt talebi bulunamadı." });
-    }
-
-    if (new Date() > new Date(pending.expires_at)) {
+    if (!pending) return sendError(res, 400, 'Kayıt isteği bulunamadı veya süresi doldu.');
+    if (pending.attempts >= 5) {
         db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
-        return res.status(400).json({ success: false, message: "Doğrulama kodunun süresi doldu. Lütfen tekrar kayıt olun." });
+        return sendError(res, 429, 'Çok fazla hatalı kod girildi. Yeniden kayıt isteği oluşturun.');
     }
-
-    if (pending.otp_code !== code) {
-        return res.status(400).json({ success: false, message: "Hatalı doğrulama kodu." });
+    if (Date.now() > Date.parse(pending.expires_at)) {
+        db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
+        return sendError(res, 400, 'Kodun süresi doldu. Yeniden kayıt olun.');
     }
-
-    const planType = 'free';
-    const limit = 3000;
-    const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    if (!safeEqual(pending.otp_code, otpHash(email, code, 'register'))) {
+        db.prepare('UPDATE pending_registrations SET attempts = attempts + 1 WHERE email = ?').run(email);
+        return sendError(res, 400, 'Doğrulama kodu hatalı.');
+    }
 
     try {
-        const result = db.transaction(() => {
-            const info = db.prepare('INSERT INTO users (email, password_hash, plan_type, error_limit, role, trial_ends_at) VALUES (?, ?, ?, ?, ?, ?)')
-                .run(email, pending.password_hash, planType, limit, 'user', trialEndsAt);
-            
-            const rawKey = "pt_live_" + crypto.randomBytes(16).toString('hex');
-            const keyHash = crypto.createHash('sha256').update(rawKey).digest('hex');
-            const keyPrefix = rawKey.substring(0, 10) + "...";
-            
+        const created = db.transaction(() => {
+            const result = db.prepare(`
+                INSERT INTO users (email, password_hash, plan_type, monthly_error_count, error_limit, role, trial_ends_at, usage_month)
+                VALUES (?, ?, 'free', 0, 3000, 'user', ?, ?)
+            `).run(email, pending.password_hash, new Date(Date.now() + 7 * 86400000).toISOString(), new Date().toISOString().slice(0, 7));
+            const userId = Number(result.lastInsertRowid);
+            const rawKey = createApiKey();
             db.prepare('INSERT INTO projects (user_id, name, api_key_hash, api_key_prefix) VALUES (?, ?, ?, ?)')
-                .run(info.lastInsertRowid, 'Varsayılan Proje', keyHash, keyPrefix);
-
+                .run(userId, 'Varsayılan Proje', sha256(rawKey), `${rawKey.slice(0, 14)}...`);
             db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
-
-            return { userId: info.lastInsertRowid, rawApiKey: rawKey };
+            return { id: userId, rawApiKey: rawKey };
         })();
-
-        const token = jwt.sign({ userId: result.userId, email }, JWT_SECRET, { expiresIn: '7d' });
-        res.json({ success: true, token, userId: result.userId, email, rawApiKey: result.rawApiKey, role: 'user', message: "Hesabınız başarıyla doğrulandı!" });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
-// Giriş Yap
-app.post('/api/auth/login', async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ success: false, message: "E-posta ve şifre zorunludur." });
-
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-    if (!user) return res.status(401).json({ success: false, message: "Hatalı e-posta veya şifre." });
-
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) return res.status(401).json({ success: false, message: "Hatalı e-posta veya şifre." });
-
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ success: true, token, userId: user.id, email: user.email, plan: user.plan_type, role: user.role });
-});
-
-// Şifre Sıfırlama İstemi
-app.post('/api/auth/forgot-password', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, message: "E-posta adresi gereklidir." });
-
-    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (!user) {
-        return res.json({ success: true, message: "Eğer bu e-posta adresi sistemimizde kayıtlıysa sıfırlama kodu gönderilmiştir." });
-    }
-
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-
-    db.prepare('UPDATE users SET reset_code = ?, reset_code_expires = ? WHERE id = ?').run(resetCode, expiresAt, user.id);
-
-    try {
-        await transporter.sendMail({
-            from: '"PulseTrace Pro" <noreply@pulsetrace.com>',
-            to: email,
-            subject: 'PulseTrace Pro - Şifre Sıfırlama Kodunuz',
-            text: `Şifre sıfırlama doğrulama kodunuz: ${resetCode}. Bu kod 15 dakika geçerlidir.`
+        const user = db.prepare('SELECT id, email, role, token_version FROM users WHERE id = ?').get(created.id);
+        res.json({
+            success: true, token: issueToken(user), userId: user.id, email: user.email,
+            role: user.role, rawApiKey: created.rawApiKey,
+            message: 'Hesabınız oluşturuldu. API anahtarını şimdi güvenli bir yere kaydedin; tekrar gösterilmez.'
         });
-        res.json({ success: true, message: "Şifre sıfırlama doğrulama kodu e-posta adresinize gönderildi." });
     } catch (err) {
-        console.error("Şifre Sıfırlama E-posta Hatası:", err);
-        res.status(500).json({ success: false, message: "E-posta gönderilemedi." });
+        console.error('OTP verification error:', err.message);
+        sendError(res, 500, 'Hesap oluşturulamadı. E-posta zaten kullanılıyor olabilir.');
     }
 });
 
-// Şifre Güncelleme
-app.post('/api/auth/reset-password', async (req, res) => {
-    const { email, code, newPassword } = req.body;
-    if (!email || !code || !newPassword) {
-        return res.status(400).json({ success: false, message: "Tüm alanları doldurmalısınız." });
+app.post('/api/auth/login', rateLimit({ max: 10, windowMs: 15 * 60 * 1000 }), async (req, res) => {
+    const email = cleanEmail(req.body?.email);
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!validEmail(email) || !password) return sendError(res, 400, 'E-posta ve şifre zorunludur.');
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+        return sendError(res, 401, 'E-posta veya şifre hatalı.');
     }
+    resetMonthlyUsage(user.id);
+    const freshUser = db.prepare('SELECT id, email, role, token_version, plan_type FROM users WHERE id = ?').get(user.id);
+    res.json({
+        success: true, token: issueToken(freshUser), userId: freshUser.id,
+        email: freshUser.email, role: freshUser.role, plan: freshUser.plan_type
+    });
+});
 
-    if (newPassword.length < 6) {
-        return res.status(400).json({ success: false, message: "Yeni şifre en az 6 karakter olmalıdır." });
-    }
+app.post('/api/auth/forgot-password', rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }), async (req, res) => {
+    const email = cleanEmail(req.body?.email);
+    if (!validEmail(email)) return sendError(res, 400, 'Geçerli bir e-posta girin.');
+    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    const genericMessage = 'Eğer bu e-posta kayıtlıysa sıfırlama kodu gönderilmiştir.';
+    if (!user) return res.json({ success: true, message: genericMessage });
 
-    const user = db.prepare('SELECT id, reset_code, reset_code_expires FROM users WHERE email = ?').get(email);
-    if (!user || !user.reset_code || user.reset_code !== code) {
-        return res.status(400).json({ success: false, message: "Geçersiz veya hatalı doğrulama kodu." });
-    }
-
-    if (new Date() > new Date(user.reset_code_expires)) {
-        return res.status(400).json({ success: false, message: "Doğrulama kodunun süresi dolmuş." });
-    }
-
+    const code = generateOtp();
+    const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    db.prepare('UPDATE users SET reset_code = ?, reset_code_expires = ? WHERE id = ?')
+        .run(otpHash(email, code, 'reset'), expires, user.id);
     try {
-        const passwordHash = await bcrypt.hash(newPassword, 12);
-        db.prepare('UPDATE users SET password_hash = ?, reset_code = NULL, reset_code_expires = NULL WHERE id = ?').run(passwordHash, user.id);
-        res.json({ success: true, message: "Şifreniz başarıyla değiştirildi. Yeni şifrenizle giriş yapabilirsiniz." });
+        await sendMail({
+            to: email,
+            subject: 'PulseTrace Pro - Şifre sıfırlama kodunuz',
+            text: `Şifre sıfırlama kodunuz: ${code}. Kod 15 dakika geçerlidir.`
+        });
+        res.json({ success: true, message: genericMessage });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        console.error('Reset mail error:', err.message);
+        sendError(res, 503, 'E-posta gönderilemedi. SMTP ayarlarını kontrol edin.');
+    }
+});
+
+app.post('/api/auth/reset-password', rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }), async (req, res) => {
+    const email = cleanEmail(req.body?.email);
+    const code = safeString(req.body?.code, 6);
+    const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+    if (!validEmail(email) || !/^\d{6}$/.test(code) || newPassword.length < 10 || newPassword.length > 128) {
+        return sendError(res, 400, 'E-posta, 6 haneli kod ve en az 10 karakterlik yeni şifre gereklidir.');
+    }
+    const user = db.prepare('SELECT id, reset_code, reset_code_expires FROM users WHERE email = ?').get(email);
+    if (!user || !user.reset_code || Date.now() > Date.parse(user.reset_code_expires) ||
+        !safeEqual(user.reset_code, otpHash(email, code, 'reset'))) {
+        return sendError(res, 400, 'Kod geçersiz veya süresi dolmuş.');
+    }
+    try {
+        const hash = await bcrypt.hash(newPassword, 12);
+        db.prepare(`
+            UPDATE users SET password_hash = ?, reset_code = NULL, reset_code_expires = NULL,
+            token_version = token_version + 1 WHERE id = ?
+        `).run(hash, user.id);
+        res.json({ success: true, message: 'Şifreniz değiştirildi. Güvenlik için yeniden giriş yapın.' });
+    } catch (err) {
+        console.error('Password reset error:', err.message);
+        sendError(res, 500, 'Şifre güncellenemedi.');
     }
 });
 
 app.get('/api/user/subscription', verifyJwtSession, (req, res) => {
-    const user = db.prepare('SELECT email, plan_type, monthly_error_count, error_limit, role, trial_ends_at FROM users WHERE id = ?').get(req.user.id);
-    let trialExpired = false;
-    if (user.trial_ends_at) {
-        trialExpired = new Date() > new Date(user.trial_ends_at);
-    }
-    res.json({ ...user, trialExpired });
+    resetMonthlyUsage(req.user.id);
+    const user = db.prepare(`
+        SELECT email, plan_type, monthly_error_count, error_limit, role, trial_ends_at
+        FROM users WHERE id = ?
+    `).get(req.user.id);
+    res.json({
+        ...user,
+        trialExpired: Boolean(user.trial_ends_at && Date.now() > Date.parse(user.trial_ends_at))
+    });
 });
 
 app.get('/api/projects', verifyJwtSession, (req, res) => {
-    const projects = db.prepare('SELECT id, name, api_key_prefix as apiKey, status FROM projects WHERE user_id = ?').all(req.user.id);
+    const projects = db.prepare(`
+        SELECT id, name, api_key_prefix AS apiKey, status, created_at
+        FROM projects WHERE user_id = ? AND revoked_at IS NULL ORDER BY id DESC
+    `).all(req.user.id);
     res.json(projects);
 });
 
 app.post('/api/projects', verifyJwtSession, (req, res) => {
-    const projectName = req.body.name;
-    if (!projectName) return res.status(400).json({ success: false, message: "Proje adı zorunludur." });
+    const name = safeString(req.body?.name, 80);
+    if (!name) return sendError(res, 400, 'Proje adı zorunludur.');
+    const projectCount = db.prepare('SELECT COUNT(*) AS n FROM projects WHERE user_id = ? AND revoked_at IS NULL').get(req.user.id).n;
+    const maxProjects = req.user.plan_type === 'free' ? 3 : 50;
+    if (projectCount >= maxProjects) return sendError(res, 403, `Paketiniz en fazla ${maxProjects} proje oluşturabilir.`);
 
-    const rawKey = "pt_live_" + crypto.randomBytes(16).toString('hex');
-    const keyHash = crypto.createHash('sha256').update(rawKey).digest('hex');
-    const keyPrefix = rawKey.substring(0, 10) + "...";
+    const rawKey = createApiKey();
+    try {
+        const result = db.prepare(`
+            INSERT INTO projects (user_id, name, api_key_hash, api_key_prefix)
+            VALUES (?, ?, ?, ?)
+        `).run(req.user.id, name, sha256(rawKey), `${rawKey.slice(0, 14)}...`);
+        res.status(201).json({
+            success: true,
+            project: { id: Number(result.lastInsertRowid), name, apiKey: rawKey, status: 'Aktif' },
+            warning: 'Bu API anahtarı yalnızca şimdi gösterilir. Güvenli biçimde saklayın.'
+        });
+    } catch (err) {
+        console.error('Project create error:', err.message);
+        sendError(res, 500, 'Proje oluşturulamadı.');
+    }
+});
+
+app.post('/api/projects/:id/rotate-key', verifyJwtSession, (req, res) => {
+    const projectId = Number(req.params.id);
+    const project = db.prepare('SELECT id FROM projects WHERE id = ? AND user_id = ? AND revoked_at IS NULL')
+        .get(projectId, req.user.id);
+    if (!project) return sendError(res, 404, 'Proje bulunamadı.');
+    const rawKey = createApiKey();
+    db.prepare('UPDATE projects SET api_key_hash = ?, api_key_prefix = ? WHERE id = ?')
+        .run(sha256(rawKey), `${rawKey.slice(0, 14)}...`, projectId);
+    res.json({ success: true, apiKey: rawKey, message: 'Yeni anahtar oluşturuldu. Eski anahtar artık geçersiz.' });
+});
+
+app.delete('/api/projects/:id', verifyJwtSession, (req, res) => {
+    const projectId = Number(req.params.id);
+    const result = db.prepare('UPDATE projects SET revoked_at = ?, status = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL')
+        .run(new Date().toISOString(), 'Pasif', projectId, req.user.id);
+    if (!result.changes) return sendError(res, 404, 'Proje bulunamadı.');
+    res.json({ success: true });
+});
+
+// SDK / harici uygulamalar buraya olay gönderir.
+app.post('/api/errors', rateLimit({ max: 120, windowMs: 60000 }), (req, res) => {
+    const rawKey = safeString(req.get('x-api-key') || (req.get('authorization') || '').replace(/^Bearer\s+/i, ''), 200);
+    if (!rawKey.startsWith('pt_live_')) return sendError(res, 401, 'Proje API anahtarı gerekli.');
+    const project = db.prepare(`
+        SELECT p.id, p.user_id, p.status, p.revoked_at, u.error_limit, u.monthly_error_count, u.usage_month
+        FROM projects p JOIN users u ON u.id = p.user_id
+        WHERE p.api_key_hash = ?
+    `).get(sha256(rawKey));
+    if (!project || project.revoked_at || project.status !== 'Aktif') return sendError(res, 401, 'API anahtarı geçersiz veya iptal edilmiş.');
+
+    resetMonthlyUsage(project.user_id);
+    const owner = db.prepare('SELECT monthly_error_count, error_limit FROM users WHERE id = ?').get(project.user_id);
+    if (owner.monthly_error_count >= owner.error_limit) return sendError(res, 429, 'Aylık hata raporu kotanız doldu.');
+
+    const message = safeString(req.body?.message, 4000);
+    if (!message) return sendError(res, 400, 'message alanı zorunludur.');
+    const stack = safeString(req.body?.stack || req.body?.stackTrace, 12000);
+    const url = safeString(req.body?.url, 2000);
+    const levelInput = safeString(req.body?.level || 'error', 20).toLowerCase();
+    const level = ['fatal', 'critical', 'error', 'warning', 'info'].includes(levelInput)
+        ? (['fatal', 'critical'].includes(levelInput) ? 'Kritik' : (levelInput === 'warning' ? 'Uyari' : 'Hata'))
+        : 'Hata';
+    const environment = safeString(req.body?.environment || 'production', 40);
+    const release = safeString(req.body?.release, 100);
+    const clientUuid = safeString(req.body?.userId || req.body?.user_id || req.body?.clientId || '', 128);
+    const browser = safeString(req.body?.browser || req.get('user-agent') || '', 500);
+    const ip = safeString(req.ip || '', 64);
+    const fingerprint = sha256(`${project.id}|${message}|${stack.split('\n')[0]}|${url}`).slice(0, 48);
+    const now = new Date().toISOString();
 
     try {
-        const info = db.prepare('INSERT INTO projects (user_id, name, api_key_hash, api_key_prefix) VALUES (?, ?, ?, ?)').run(req.user.id, projectName, keyHash, keyPrefix);
-        res.json({ success: true, project: { id: info.lastInsertRowid, name: projectName, apiKey: rawKey, status: 'Aktif' } });
+        const result = db.transaction(() => {
+            let existing = db.prepare(`
+                SELECT id FROM errors WHERE project_id = ? AND fingerprint = ? AND status = 'Aktif'
+            `).get(project.id, fingerprint);
+            let errorId;
+            if (existing) {
+                errorId = existing.id;
+                db.prepare(`
+                    UPDATE errors SET count = count + 1, last_seen = ?, level = ?,
+                    message = ?, stack = ?, url = ?, ip = ?, browser = ?,
+                    environment = ?, release = ? WHERE id = ?
+                `).run(now, level, message, stack, url, ip, browser, environment, release, errorId);
+            } else {
+                const inserted = db.prepare(`
+                    INSERT INTO errors
+                    (project_id, level, status, message, stack, url, ip, browser, fingerprint,
+                     count, affected_users, first_seen, last_seen, timestamp, environment, release)
+                    VALUES (?, ?, 'Aktif', ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)
+                `).run(project.id, level, message, stack, url, ip, browser, fingerprint, now, now, now, environment, release);
+                errorId = Number(inserted.lastInsertRowid);
+            }
+
+            if (clientUuid) {
+                db.prepare('INSERT OR IGNORE INTO error_clients (error_id, client_uuid) VALUES (?, ?)')
+                    .run(errorId, clientUuid);
+            }
+            const uniqueUsers = db.prepare('SELECT COUNT(*) AS n FROM error_clients WHERE error_id = ?').get(errorId).n;
+            db.prepare('UPDATE errors SET affected_users = ? WHERE id = ?').run(uniqueUsers, errorId);
+            db.prepare('UPDATE users SET monthly_error_count = monthly_error_count + 1 WHERE id = ?').run(project.user_id);
+            return { errorId, grouped: Boolean(existing), occurrenceCount: existing
+                ? db.prepare('SELECT count FROM errors WHERE id = ?').get(errorId).count : 1 };
+        })();
+        res.status(202).json({ success: true, message: 'Hata olayı alındı.', ...result });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        console.error('Error ingestion failed:', err.message);
+        sendError(res, 500, 'Hata olayı kaydedilemedi.');
     }
 });
 
 app.get('/api/errors', verifyJwtSession, (req, res) => {
-    const projId = req.query.projectId;
-    let query = `
-        e.*, p.name as project 
-        FROM errors e 
-        JOIN projects p ON e.project_id = p.id 
-        WHERE p.user_id = ?
-    `;
-    let params = [req.user.id];
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 200;
+    const beforeId = Number.parseInt(req.query.beforeId, 10);
+    const projectId = req.query.projectId ? Number.parseInt(req.query.projectId, 10) : null;
 
-    if (projId) {
-        query += ` AND e.project_id = ?`;
-        params.push(projId);
+    let sql = `
+        SELECT e.*, p.name AS project
+        FROM errors e JOIN projects p ON p.id = e.project_id
+        WHERE p.user_id = ? AND p.revoked_at IS NULL
+    `;
+    const params = [req.user.id];
+    if (projectId !== null) {
+        if (!Number.isInteger(projectId)) return sendError(res, 400, 'Geçersiz proje ID.');
+        sql += ' AND e.project_id = ?';
+        params.push(projectId);
     }
-    query += ` ORDER BY e.id DESC`;
-    res.json(db.prepare(`SELECT ${query}`).all(...params));
+    if (Number.isInteger(beforeId)) {
+        sql += ' AND e.id < ?';
+        params.push(beforeId);
+    }
+    sql += ' ORDER BY e.id DESC LIMIT ?';
+    params.push(limit);
+    res.json(db.prepare(sql).all(...params));
 });
 
 app.patch('/api/errors/:id/resolve', verifyJwtSession, (req, res) => {
-    const id = parseInt(req.params.id);
-    const errorCheck = db.prepare(`
-        SELECT e.id FROM errors e 
-        JOIN projects p ON e.project_id = p.id 
-        WHERE e.id = ? AND p.user_id = ?
-    `).get(id, req.user.id);
-
-    if (!errorCheck) return res.status(403).json({ success: false, message: "Yetkisiz işlem." });
-
-    db.prepare("UPDATE errors SET status = 'Çözüldü' WHERE id = ?").run(id);
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return sendError(res, 400, 'Geçersiz hata ID.');
+    const result = db.prepare(`
+        UPDATE errors SET status = 'Çözüldü'
+        WHERE id = ? AND project_id IN (
+            SELECT id FROM projects WHERE user_id = ? AND revoked_at IS NULL
+        )
+    `).run(id, req.user.id);
+    if (!result.changes) return sendError(res, 404, 'Hata bulunamadı veya işlem yetkiniz yok.');
     res.json({ success: true });
 });
 
-// Arayüz (index.html sunumu)
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="tr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PulseTrace Pro - Multi-Tenant SaaS Enterprise</title>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-color: #0a0a0c;
-            --card-bg: #121318;
-            --border-color: #1e2029;
-            --neon-green: #00ff66;
-            --neon-green-glow: rgba(0, 255, 102, 0.2);
-            --text-main: #f0f2f5;
-            --text-muted: #8b949e;
-            --danger: #ff3366;
-            --warning: #ffaa00;
-            --info: #00e5ff;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
-        body { background-color: var(--bg-color); color: var(--text-main); min-height: 100vh; padding: 20px; }
-        header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 20px; margin-bottom: 25px; flex-wrap: wrap; gap: 15px; }
-        .logo-area { display: flex; align-items: center; gap: 12px; }
-        .logo-icon { width: 12px; height: 12px; background: var(--neon-green); border-radius: 50%; box-shadow: 0 0 10px var(--neon-green); animation: pulse 2s infinite; }
-        h1 { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; color: var(--text-main); }
-        h1 span { color: var(--neon-green); }
-        .top-controls { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
-        select, input { background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-main); padding: 8px 12px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 13px; outline: none; }
-        .status-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; font-family: 'JetBrains Mono'; color: var(--neon-green); background: rgba(0,255,102,0.1); padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(0,255,102,0.3); }
-        .status-dot { width: 8px; height: 8px; background: var(--neon-green); border-radius: 50%; box-shadow: 0 0 6px var(--neon-green); }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 25px; }
-        .stat-card { background: var(--card-bg); border: 1px solid var(--border-color); padding: 20px; border-radius: 10px; position: relative; overflow: hidden; }
-        .stat-card::after { content: ''; position: absolute; top: 0; left: 0; width: 3px; height: 100%; background: var(--neon-green); }
-        .stat-title { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; font-family: 'JetBrains Mono', monospace; }
-        .stat-value { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; color: var(--text-main); }
-        .quota-widget { background: var(--card-bg); border: 1px solid var(--border-color); padding: 20px; border-radius: 10px; margin-bottom: 25px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px; }
-        .quota-info { display: flex; flex-direction: column; gap: 6px; }
-        .quota-bar-bg { width: 250px; height: 8px; background: #1a1c26; border-radius: 4px; overflow: hidden; border: 1px solid var(--border-color); }
-        .quota-bar-fill { height: 100%; background: var(--neon-green); width: 0%; transition: width 0.4s ease; }
-        .plan-badge { background: rgba(0,229,255,0.1); border: 1px solid var(--info); color: var(--info); padding: 4px 10px; border-radius: 6px; font-family: 'JetBrains Mono'; font-size: 12px; font-weight: bold; text-transform: uppercase; }
-        .analytics-box { background: var(--card-bg); border: 1px solid var(--border-color); padding: 20px; border-radius: 10px; margin-bottom: 25px; }
-        .timeline-container { display: flex; align-items: flex-end; height: 80px; gap: 12px; margin-top: 15px; border-bottom: 1px solid var(--border-color); padding-bottom: 5px; overflow-x: auto; }
-        .timeline-bar-wrapper { display: flex; flex-direction: column; align-items: center; gap: 4px; }
-        .timeline-bar { width: 35px; background: rgba(0,255,102,0.2); border: 1px solid var(--neon-green); border-radius: 4px 4px 0 0; display: flex; justify-content: center; align-items: flex-start; font-size: 11px; font-family: 'JetBrains Mono'; color: var(--neon-green); padding-top: 4px; transition: 0.3s; }
-        .filter-bar { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center; }
-        .filter-chip { background: #161821; border: 1px solid var(--border-color); color: var(--text-muted); padding: 6px 14px; border-radius: 20px; font-size: 12px; font-family: 'JetBrains Mono'; cursor: pointer; transition: 0.2s; }
-        .filter-chip.active { background: rgba(0,255,102,0.1); border-color: var(--neon-green); color: var(--neon-green); }
-        .btn { background: var(--neon-green); color: #000; border: none; padding: 10px 18px; font-weight: 600; border-radius: 6px; cursor: pointer; font-family: 'JetBrains Mono', monospace; transition: 0.2s; box-shadow: 0 0 15px var(--neon-green-glow); font-size: 13px; }
-        .btn:hover { background: #00cc52; box-shadow: 0 0 25px var(--neon-green); }
-        .btn-secondary { background: transparent; border: 1px solid var(--neon-green); color: var(--neon-green); box-shadow: none; }
-        .btn-secondary:hover { background: rgba(0,255,102,0.1); }
-        .btn-warning { background: var(--warning); color: #000; }
-        .table-container { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 10px; overflow-x: auto; margin-bottom: 30px; }
-        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; min-width: 700px; }
-        th { background: #161821; color: var(--text-muted); padding: 14px 18px; font-family: 'JetBrains Mono', monospace; font-size: 12px; border-bottom: 1px solid var(--border-color); }
-        td { padding: 14px 18px; border-bottom: 1px solid var(--border-color); font-family: 'JetBrains Mono', monospace; cursor: pointer; white-space: nowrap; }
-        tr:hover td { background: rgba(0,255,102,0.02); }
-        .level-kritik { color: var(--danger); font-weight: bold; }
-        .level-uyari { color: var(--warning); font-weight: bold; }
-        .status-aktif { color: var(--danger); background: rgba(255,51,102,0.1); padding: 4px 8px; border-radius: 4px; font-size: 11px; }
-        .status-cozuldu { color: var(--neon-green); background: rgba(0,255,102,0.1); padding: 4px 8px; border-radius: 4px; font-size: 11px; }
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(5px); justify-content: center; align-items: center; z-index: 1000; }
-        .modal-content { background: var(--card-bg); border: 1px solid var(--neon-green); width: 480px; max-width: 90%; padding: 30px; border-radius: 12px; box-shadow: 0 0 30px var(--neon-green-glow); }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid var(--border-color); padding-bottom: 15px; }
-        .modal-title { font-family: 'JetBrains Mono', monospace; font-size: 18px; color: var(--neon-green); }
-        .modal-body { font-family: 'JetBrains Mono', monospace; font-size: 13px; display: flex; flex-direction: column; gap: 12px; }
-        .modal-row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--border-color); padding-bottom: 8px; }
-        .modal-label { color: var(--text-muted); }
-        .stack-trace { background: #050507; padding: 12px; border-radius: 6px; border: 1px solid var(--border-color); color: var(--danger); white-space: pre-wrap; font-size: 12px; margin-top: 5px; max-height: 150px; overflow-y: auto; word-break: break-all; }
-        .project-section { background: var(--card-bg); border: 1px solid var(--border-color); padding: 20px; border-radius: 10px; margin-top: 20px; }
-        .project-list { display: flex; gap: 15px; flex-wrap: wrap; margin-top: 15px; }
-        .project-badge-card { background: #161821; border: 1px solid var(--border-color); padding: 15px; border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 13px; min-width: 280px; }
-        .api-key-box { display: flex; align-items: center; gap: 8px; margin-top: 8px; background: #0a0a0c; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border-color); }
-        .auth-tabs { display: flex; gap: 10px; margin-bottom: 15px; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; }
-        .auth-tab { background: none; border: none; color: var(--text-muted); font-family: 'JetBrains Mono'; font-size: 14px; cursor: pointer; padding-bottom: 5px; }
-        .auth-tab.active { color: var(--neon-green); border-bottom: 2px solid var(--neon-green); }
-        @keyframes pulse { 0% { transform: scale(0.95); opacity: 0.7; } 70% { transform: scale(1); opacity: 1; } 100% { transform: scale(0.95); opacity: 0.7; } }
-    </style>
-</head>
-<body>
-    <header>
-        <div class="logo-area">
-            <div class="logo-icon"></div>
-            <h1>PulseTrace <span>Pro</span> Enterprise</h1>
-        </div>
-        <div class="top-controls">
-            <div class="status-indicator"><div class="status-dot"></div><span>Güvenli JWT Bağlantısı</span></div>
-            <input type="text" id="searchInput" placeholder="🔍 Hata ara..." oninput="filterAndRenderErrors()" style="width: 180px;">
-            <select id="projectSelect" onchange="loadErrors()">
-                <option value="">Tüm Projelerim</option>
-            </select>
-            <span id="userEmailDisplay" style="font-family: 'JetBrains Mono'; font-size: 12px; color: var(--neon-green);"></span>
-            <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 11px;" onclick="logoutUser()">Çıkış Yap</button>
-        </div>
-    </header>
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
 
-    <div class="quota-widget">
-        <div class="quota-info">
-            <div style="display: flex; align-items: center; gap: 10px;">
-                <span style="font-family: 'JetBrains Mono'; font-size: 14px; color: #fff;">📦 Aktif Abonelik Paketi:</span>
-                <span class="plan-badge" id="planBadgeText">FREE</span>
-            </div>
-            <div style="font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono';" id="quotaText">
-                Aylık Kullanım: 0 / 3,000 Hata Raporu (7 Günlük Deneme Aktif)
-            </div>
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 6px; align-items: flex-end;">
-            <div class="quota-bar-bg">
-                <div class="quota-bar-fill" id="quotaBarFill"></div>
-            </div>
-            <span style="font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono';" id="quotaPercentText">%0 Kullanıldı</span>
-        </div>
-    </div>
-
-    <div class="stats-grid">
-        <div class="stat-card">
-            <div class="stat-title">FİLTRELENEN / TOPLAM</div>
-            <div class="stat-value"><span id="filteredCount">0</span> / <span id="totalCount">0</span></div>
-        </div>
-        <div class="stat-card" style="--neon-green: var(--danger);">
-            <div class="stat-title">KRİTİK ÇÖKMELER</div>
-            <div class="stat-value" id="criticalCount">0</div>
-        </div>
-        <div class="stat-card" style="--neon-green: var(--info);">
-            <div class="stat-title">TEKİL KULLANICI (UUID)</div>
-            <div class="stat-value" id="affectedCount">0</div>
-        </div>
-        <div class="stat-card" style="--neon-green: var(--warning);">
-            <div class="stat-title">ÇÖZÜLEN HATA</div>
-            <div class="stat-value" id="resolvedCount">0</div>
-        </div>
-    </div>
-
-    <div class="analytics-box">
-        <div style="font-family: 'JetBrains Mono'; font-size: 14px; color: var(--neon-green); margin-bottom: 5px;">📈 Gerçek Zamanlı Hata Çizelgesi</div>
-        <div class="timeline-container" id="timelineContainer"></div>
-    </div>
-
-    <div class="filter-bar">
-        <span style="font-family: 'JetBrains Mono'; font-size: 12px; color: var(--text-muted); margin-right: 5px;">Filtre:</span>
-        <div class="filter-chip active" onclick="setSeverityFilter('Tumu', this)">Aktif Tümü</div>
-        <div class="filter-chip" onclick="setSeverityFilter('Kritik', this)">Kritik</div>
-        <div class="filter-chip" onclick="setSeverityFilter('Uyari', this)">Uyarı</div>
-        <div class="filter-chip" onclick="setSeverityFilter('Cozuldu', this)">Çözüldü</div>
-    </div>
-
-    <div class="table-container">
-        <table>
-            <thead>
-                <tr><th>ID</th><th>PROJE</th><th>SEVİYE</th><th>HATA MESAJI</th><th>TEKRAR</th><th>TEKİL KULLANICI</th><th>DURUM</th></tr>
-            </thead>
-            <tbody id="errorTableBody"></tbody>
-        </table>
-    </div>
-
-    <div class="project-section">
-        <h3 style="font-family: 'JetBrains Mono'; font-size: 15px; margin-bottom: 10px; color: var(--neon-green);">🏢 Projelerim & API Anahtarları</h3>
-        <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
-            <input type="text" id="newProjectName" placeholder="Yeni Proje Adı" style="flex: 1; max-width: 300px;">
-            <button class="btn btn-secondary" onclick="createProject()">+ Proje Oluştur</button>
-        </div>
-        <div class="project-list" id="projectListContainer"></div>
-    </div>
-
-    <!-- GİRİŞ / KAYIT / OTP DOĞRULAMA MODALI -->
-    <div class="modal-overlay" id="authModal" style="display: flex;">
-        <div class="modal-content" style="width: 420px;">
-            <div class="auth-tabs">
-                <button class="auth-tab active" id="tabLoginBtn" onclick="switchAuthTab('login')">Giriş Yap</button>
-                <button class="auth-tab" id="tabRegisterBtn" onclick="switchAuthTab('register')">Kayıt Ol (OTP)</button>
-            </div>
-            
-            <!-- GİRİŞ FORMU -->
-            <div id="loginFormContainer" class="modal-body">
-                <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 5px;">E-posta Adresi:</p>
-                <input type="email" id="loginEmail" placeholder="ornek@domain.com" style="width: 100%; padding: 10px;">
-                <p style="color: var(--text-muted); font-size: 12px; margin-top: 10px; margin-bottom: 5px;">Şifre:</p>
-                <input type="password" id="loginPassword" placeholder="••••••••" style="width: 100%; padding: 10px;">
-                
-                <div style="display: flex; justify-content: flex-end; margin-top: 5px;">
-                    <a href="#" onclick="switchAuthTab('forgot')" style="color: var(--info); font-size: 11px; text-decoration: none;">Şifremi Unuttum?</a>
-                </div>
-
-                <button class="btn" style="width: 100%; margin-top: 15px;" onclick="handleLogin()">Giriş Yap</button>
-            </div>
-
-            <!-- KAYIT & OTP FORMU -->
-            <div id="registerFormContainer" class="modal-body" style="display: none;">
-                <div style="background: rgba(0,255,102,0.05); border: 1px solid rgba(0,255,102,0.2); padding: 10px; border-radius: 6px; margin-bottom: 5px; font-size: 11px; color: var(--neon-green);">
-                    🟢 Kayıt olduğunuzda e-postanıza 6 haneli doğrulama kodu (OTP) gönderilir.
-                </div>
-                <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 5px;">E-posta Adresi:</p>
-                <input type="email" id="regEmail" placeholder="ornek@domain.com" style="width: 100%; padding: 10px;">
-                <p style="color: var(--text-muted); font-size: 12px; margin-top: 10px; margin-bottom: 5px;">Şifre Belirle (En az 6 karakter):</p>
-                <input type="password" id="regPassword" placeholder="En az 6 karakter" style="width: 100%; padding: 10px;">
-                
-                <button class="btn" style="width: 100%; margin-top: 20px;" onclick="handleRegister()">Doğrulama Kodu Gönder</button>
-            </div>
-
-            <!-- ŞİFREMİ UNUTTUM FORMU -->
-            <div id="forgotFormContainer" class="modal-body" style="display: none;">
-                <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 5px;">Kayıtlı E-posta Adresiniz:</p>
-                <input type="email" id="forgotEmail" placeholder="ornek@domain.com" style="width: 100%; padding: 10px;">
-                <button class="btn btn-warning" style="width: 100%; margin-top: 15px;" onclick="handleForgotPassword()">Sıfırlama Kodu Gönder</button>
-                <button class="btn btn-secondary" style="width: 100%; margin-top: 5px;" onclick="switchAuthTab('login')">Geri Dön</button>
-            </div>
-
-            <!-- ŞİFRE SIFIRLAMA ONAY FORMU -->
-            <div id="resetFormContainer" class="modal-body" style="display: none;">
-                <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 5px;">6 Haneli Kod:</p>
-                <input type="text" id="resetCode" placeholder="123456" style="width: 100%; padding: 10px; letter-spacing: 2px;">
-                <p style="color: var(--text-muted); font-size: 12px; margin-top: 10px; margin-bottom: 5px;">Yeni Şifre:</p>
-                <input type="password" id="newPassword" placeholder="••••••••" style="width: 100%; padding: 10px;">
-                <button class="btn" style="width: 100%; margin-top: 15px;" onclick="handleResetPassword()">Şifreyi Değiştir</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- HATA DETAY MODALI -->
-    <div class="modal-overlay" id="errorModal">
-        <div class="modal-content" style="width: 650px;">
-            <div class="modal-header">
-                <div class="modal-title" id="modalTitle">Hata Detayı</div>
-                <button class="btn btn-secondary" style="padding: 2px 8px;" onclick="closeModal()">✕</button>
-            </div>
-            <div class="modal-body" id="modalBody"></div>
-            <div class="modal-footer" style="margin-top: 25px; display: flex; justify-content: flex-end; gap: 10px;">
-                <button class="btn btn-warning" id="resolveBtn">✔ Çözüldü Olarak İşaretle</button>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let authToken = localStorage.getItem('pulsetrace_jwt') || "";
-        let userEmail = localStorage.getItem('pulsetrace_email') || "";
-        let userRole = localStorage.getItem('pulsetrace_role') || "user";
-        let registeredEmailTemp = "";
-        let resetEmailTarget = "";
-        let currentErrors = [];
-        let allProjects = [];
-        let activeSeverityFilter = 'Tumu';
-
-        function getAuthHeaders() {
-            return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken };
-        }
-
-        function checkSession() {
-            if (!authToken) {
-                document.getElementById('authModal').style.display = 'flex';
-                return false;
-            }
-            document.getElementById('userEmailDisplay').innerText = \`👤 \${userEmail}\`;
-            document.getElementById('authModal').style.display = 'none';
-            return true;
-        }
-
-        function logoutUser() {
-            localStorage.clear();
-            authToken = "";
-            userEmail = "";
-            window.location.reload();
-        }
-
-        function switchAuthTab(tab) {
-            document.getElementById('loginFormContainer').style.display = 'none';
-            document.getElementById('registerFormContainer').style.display = 'none';
-            document.getElementById('forgotFormContainer').style.display = 'none';
-            document.getElementById('resetFormContainer').style.display = 'none';
-            
-            if (tab === 'login') {
-                document.getElementById('tabLoginBtn').classList.add('active');
-                document.getElementById('tabRegisterBtn').classList.remove('active');
-                document.getElementById('loginFormContainer').style.display = 'flex';
-            } else if (tab === 'register') {
-                document.getElementById('tabRegisterBtn').classList.add('active');
-                document.getElementById('tabLoginBtn').classList.remove('active');
-                document.getElementById('registerFormContainer').style.display = 'flex';
-            } else if (tab === 'forgot') {
-                document.getElementById('forgotFormContainer').style.display = 'flex';
-            } else if (tab === 'reset') {
-                document.getElementById('resetFormContainer').style.display = 'flex';
-            }
-        }
-
-        async function handleLogin() {
-            const email = document.getElementById('loginEmail').value.trim();
-            const password = document.getElementById('loginPassword').value.trim();
-            if(!email || !password) return alert('Lütfen alanları doldurun!');
-
-            try {
-                const res = await fetch('/api/auth/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email, password })
-                });
-                const data = await res.json();
-                if (data.success) {
-                    authToken = data.token;
-                    userEmail = data.email;
-                    userRole = data.role;
-                    localStorage.setItem('pulsetrace_jwt', authToken);
-                    localStorage.setItem('pulsetrace_email', userEmail);
-                    localStorage.setItem('pulsetrace_role', userRole);
-                    document.getElementById('authModal').style.display = 'none';
-                    init();
-                } else { alert(data.message); }
-            } catch (err) { alert('Giriş hatası.'); }
-        }
-
-        async function handleRegister() {
-            const email = document.getElementById('regEmail').value.trim();
-            const password = document.getElementById('regPassword').value.trim();
-            if(!email || !password) return alert('Lütfen alanları doldurun!');
-            if(password.length < 6) return alert('Şifre en az 6 karakter olmalıdır!');
-
-            registeredEmailTemp = email;
-
-            try {
-                const res = await fetch('/api/auth/register', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email, password })
-                });
-                const data = await res.json();
-                if (data.success) {
-                    alert(data.message);
-                    document.getElementById('registerFormContainer').innerHTML = \`
-                        <div style="color: var(--neon-green); font-size: 12px; margin-bottom: 10px;">
-                            ✉️ E-postanıza gelen 6 haneli doğrulama kodunu girin:
-                        </div>
-                        <input type="text" id="otpCodeVerify" placeholder="123456" maxlength="6" style="width: 100%; padding: 10px; letter-spacing: 3px; text-align: center; font-size: 18px;">
-                        <button class="btn" style="width: 100%; margin-top: 15px;" onclick="handleVerifyOtp()">Kodu Doğrula ve Kaydı Tamamla</button>
-                    \`;
-                } else { alert(data.message); }
-            } catch (err) { alert('Kayıt isteği başarısız.'); }
-        }
-
-        async function handleVerifyOtp() {
-            const code = document.getElementById('otpCodeVerify').value.trim();
-            if (!code || code.length !== 6) return alert('Lütfen 6 haneli kodu eksiksiz girin!');
-
-            try {
-                const res = await fetch('/api/auth/verify-otp', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email: registeredEmailTemp, code })
-                });
-                const data = await res.json();
-                if (data.success) {
-                    authToken = data.token;
-                    userEmail = data.email;
-                    userRole = data.role;
-                    localStorage.setItem('pulsetrace_jwt', authToken);
-                    localStorage.setItem('pulsetrace_email', userEmail);
-                    localStorage.setItem('pulsetrace_role', userRole);
-                    alert(\`Hesabınız başarıyla doğrulandı!\\n\\nAPI Anahtarınız:\\n\${data.rawApiKey}\`);
-                    document.getElementById('authModal').style.display = 'none';
-                    init();
-                } else { alert(data.message); }
-            } catch (err) { alert('Doğrulama hatası.'); }
-        }
-
-        async function handleForgotPassword() {
-            const email = document.getElementById('forgotEmail').value.trim();
-            if(!email) return alert('E-posta girin!');
-            resetEmailTarget = email;
-
-            try {
-                const res = await fetch('/api/auth/forgot-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email })
-                });
-                const data = await res.json();
-                if (data.success) {
-                    alert(data.message);
-                    switchAuthTab('reset');
-                } else { alert(data.message); }
-            } catch (err) { alert('Hata oluştu.'); }
-        }
-
-        async function handleResetPassword() {
-            const code = document.getElementById('resetCode').value.trim();
-            const newPassword = document.getElementById('newPassword').value.trim();
-            if(!code || !newPassword) return alert('Tüm alanları doldurun!');
-
-            try {
-                const res = await fetch('/api/auth/reset-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email: resetEmailTarget, code, newPassword })
-                });
-                const data = await res.json();
-                if (data.success) {
-                    alert(data.message);
-                    switchAuthTab('login');
-                } else { alert(data.message); }
-            } catch (err) { alert('İşlem başarısız.'); }
-        }
-
-        async function init() {
-            if (!checkSession()) return;
-            await loadSubscriptionInfo();
-            await loadProjects();
-            await loadErrors();
-        }
-
-        async function loadSubscriptionInfo() {
-            try {
-                const res = await fetch('/api/user/subscription', { headers: getAuthHeaders() });
-                if (res.ok) {
-                    const sub = await res.json();
-                    document.getElementById('planBadgeText').innerText = sub.plan_type.toUpperCase();
-                    document.getElementById('quotaText').innerText = \`Aylık Kullanım: \${sub.monthly_error_count} / \${sub.error_limit} Hata Raporu\`;
-                    const percent = Math.min(Math.round((sub.monthly_error_count / sub.error_limit) * 100), 100);
-                    document.getElementById('quotaBarFill').style.width = percent + '%';
-                    document.getElementById('quotaPercentText').innerText = \`%\${percent} Kullanıldı\`;
-                } else if(res.status === 401) { logoutUser(); }
-            } catch (err) { console.error(err); }
-        }
-
-        async function loadProjects() {
-            try {
-                const res = await fetch('/api/projects', { headers: getAuthHeaders() });
-                if(res.status === 401) { logoutUser(); return; }
-                allProjects = await res.json();
-                
-                const select = document.getElementById('projectSelect');
-                const container = document.getElementById('projectListContainer');
-                let optionsHTML = '<option value="">Tüm Projelerim</option>';
-                let cardsHTML = '';
-
-                allProjects.forEach(p => {
-                    optionsHTML += \`<option value="\${p.id}">\${escapeHtml(p.name)}</option>\`;
-                    cardsHTML += \`
-                        <div class="project-badge-card">
-                            <div style="color: #fff; font-weight: bold; margin-bottom: 6px;">📂 \${escapeHtml(p.name)}</div>
-                            <div style="color: var(--text-muted); font-size: 11px;">API Anahtarı (Maskelenmiş):</div>
-                            <div class="api-key-box">
-                                <input type="text" value="\${p.apiKey}" readonly style="border:none; background:transparent; color: var(--neon-green); width: 100%; font-size: 11px;">
-                                <button class="btn btn-secondary" style="padding: 4px 8px; font-size: 10px;" onclick="navigator.clipboard.writeText('\${p.apiKey}'); alert('Kopyalandı!');">Kopyala</button>
-                            </div>
-                        </div>
-                    \`;
-                });
-
-                select.innerHTML = optionsHTML;
-                container.innerHTML = cardsHTML;
-            } catch (err) { console.error(err); }
-        }
-
-        async function loadErrors() {
-            if(!checkSession()) return;
-            const selectedProj = document.getElementById('projectSelect').value;
-            let url = '/api/errors';
-            if (selectedProj) url += '?projectId=' + selectedProj;
-
-            try {
-                const res = await fetch(url, { headers: getAuthHeaders() });
-                if(res.status === 401) { logoutUser(); return; }
-                currentErrors = await res.json();
-                filterAndRenderErrors();
-                renderTimeline();
-            } catch (err) { console.error(err); }
-        }
-
-        function escapeHtml(str) {
-            if (!str) return '';
-            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
-        }
-
-        function setSeverityFilter(sev, el) {
-            document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
-            el.classList.add('active');
-            activeSeverityFilter = sev;
-            filterAndRenderErrors();
-        }
-
-        function filterAndRenderErrors() {
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-            let totalActive = currentErrors.filter(e => e.status === 'Aktif').length;
-            let criticals = currentErrors.filter(e => e.status === 'Aktif' && e.level === 'Kritik').length;
-            let affected = currentErrors.filter(e => e.status === 'Aktif').reduce((acc, curr) => acc + curr.affected_users, 0);
-            let resolved = currentErrors.filter(e => e.status === 'Çözüldü').length;
-
-            document.getElementById('totalCount').innerText = totalActive;
-            document.getElementById('criticalCount').innerText = criticals;
-            document.getElementById('affectedCount').innerText = affected;
-            document.getElementById('resolvedCount').innerText = resolved;
-
-            let filtered = currentErrors.filter(item => 
-                item.message.toLowerCase().includes(searchTerm) || 
-                item.url.toLowerCase().includes(searchTerm)
-            );
-
-            if (activeSeverityFilter === 'Kritik') filtered = filtered.filter(e => e.level === 'Kritik' && e.status === 'Aktif');
-            else if (activeSeverityFilter === 'Uyari') filtered = filtered.filter(e => e.level === 'Uyari' && e.status === 'Aktif');
-            else if (activeSeverityFilter === 'Cozuldu') filtered = filtered.filter(e => e.status === 'Çözüldü');
-            else if (activeSeverityFilter === 'Tumu') filtered = filtered.filter(e => e.status === 'Aktif');
-
-            document.getElementById('filteredCount').innerText = filtered.length;
-            const tbody = document.getElementById('errorTableBody');
-            tbody.innerHTML = '';
-
-            filtered.forEach(item => {
-                const tr = document.createElement('tr');
-                const levelClass = item.level === 'Kritik' ? 'level-kritik' : 'level-uyari';
-                const statusBadge = item.status === 'Aktif' ? '<span class="status-aktif">Aktif</span>' : '<span class="status-cozuldu">Çözüldü</span>';
-                
-                tr.innerHTML = \`
-                    <td>#\${escapeHtml(String(item.id))}</td>
-                    <td>\${escapeHtml(item.project)}</td>
-                    <td class="\${levelClass}">\${escapeHtml(item.level)}</td>
-                    <td style="color: #fff;">\${escapeHtml(item.message)}</td>
-                    <td><span style="color:var(--info); font-weight:bold;">\${escapeHtml(String(item.count))}x</span></td>
-                    <td>\${escapeHtml(String(item.affected_users))} tekil</td>
-                    <td>\${statusBadge}</td>
-                \`;
-                tr.onclick = () => openModal(item.id);
-                tbody.appendChild(tr);
-            });
-        }
-
-        function renderTimeline() {
-            const container = document.getElementById('timelineContainer');
-            container.innerHTML = '';
-            const timeMap = {};
-            currentErrors.forEach(e => {
-                const hour = e.last_seen ? e.last_seen.substring(0, 5) : "00:00";
-                timeMap[hour] = (timeMap[hour] || 0) + e.count;
-            });
-            const keys = Object.keys(timeMap).sort();
-            if(keys.length === 0) {
-                container.innerHTML = '<div style="color:var(--text-muted); font-size:12px; font-family:JetBrains Mono;">Henüz veri yok.</div>';
-                return;
-            }
-            keys.forEach(h => {
-                const count = timeMap[h];
-                container.innerHTML += \`
-                    <div class="timeline-bar-wrapper">
-                        <div class="timeline-bar" style="height: \${Math.min(count * 15, 65)}px;" title="\${h} - \${count} hata">\${count}</div>
-                        <span class="timeline-label" style="font-size:10px; color:var(--text-muted);">\${h}</span>
-                    </div>
-                \`;
-            });
-        }
-
-        async function createProject() {
-            const nameInput = document.getElementById('newProjectName');
-            if(!nameInput.value.trim()) return alert('Proje adı girin!');
-            
-            const res = await fetch('/api/projects', {
-                method: 'POST',
-                headers: getAuthHeaders(),
-                body: JSON.stringify({ name: nameInput.value })
-            });
-            const data = await res.json();
-            if(data.success) {
-                nameInput.value = '';
-                alert(\`Proje oluşturuldu!\\n\\nAPI Anahtarınız:\\n\${data.project.apiKey}\`);
-                loadProjects();
-            } else { alert(data.message); }
-        }
-
-        function openModal(id) {
-            const err = currentErrors.find(e => e.id === id);
-            if(!err) return;
-            document.getElementById('modalTitle').innerText = 'Hata Detayı #' + err.id;
-            
-            const modalBody = document.getElementById('modalBody');
-            modalBody.innerHTML = \`
-                <div class="modal-row"><span class="modal-label">Seviye:</span><span>\${err.level}</span></div>
-                <div class="modal-row"><span class="modal-label">Tekrar:</span><span>\${err.count} Kez</span></div>
-                <div class="modal-row"><span class="modal-label">Endpoint:</span><span>\${err.url}</span></div>
-                <div><span class="modal-label">Stack Trace:</span><div class="stack-trace">\${escapeHtml(err.stack)}</div></div>
-            \`;
-
-            const resolveBtn = document.getElementById('resolveBtn');
-            if(err.status === 'Aktif') {
-                resolveBtn.style.display = 'inline-block';
-                resolveBtn.onclick = async () => {
-                    await fetch('/api/errors/' + err.id + '/resolve', { method: 'PATCH', headers: getAuthHeaders() });
-                    closeModal();
-                    loadErrors();
-                };
-            } else { resolveBtn.style.display = 'none'; }
-            document.getElementById('errorModal').style.display = 'flex';
-        }
-
-        function closeModal() { document.getElementById('errorModal').style.display = 'none'; }
-
-        init();
-        setInterval(loadErrors, 6000);
-    </script>
-</body>
-</html>`);
+app.use((err, req, res, next) => {
+    console.error('Unhandled request error:', err.message);
+    if (res.headersSent) return next(err);
+    const status = err.type === 'entity.too.large' ? 413 : 500;
+    sendError(res, status, status === 413 ? 'İstek boyutu çok büyük.' : 'Sunucu hatası.');
 });
 
 app.listen(PORT, () => {
-    console.log("[PulseTrace Enterprise] Sunucu aktif: http://localhost:" + PORT);
+    console.log(`[PulseTrace Pro] Sunucu aktif: http://localhost:${PORT}`);
+    console.log(`[PulseTrace Pro] Veritabanı: ${DB_PATH}`);
+});
+
+process.on('SIGINT', () => {
+    try { db.close(); } catch {}
+    process.exit(0);
+});
+process.on('SIGTERM', () => {
+    try { db.close(); } catch {}
+    process.exit(0);
 });

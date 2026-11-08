@@ -77,6 +77,18 @@
         .auth-tab { background: none; border: none; color: var(--text-muted); font-family: 'JetBrains Mono'; font-size: 14px; cursor: pointer; padding-bottom: 5px; }
         .auth-tab.active { color: var(--neon-green); border-bottom: 2px solid var(--neon-green); }
         @keyframes pulse { 0% { transform: scale(0.95); opacity: 0.7; } 70% { transform: scale(1); opacity: 1; } 100% { transform: scale(0.95); opacity: 0.7; } }
+    
+        .timeline-container { min-width: 600px; }
+        .analytics-box { overflow-x: auto; }
+        @media (max-width: 700px) {
+            body { padding: 10px; }
+            .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+            .stat-card { padding: 12px; }
+            .stat-value { font-size: 20px; }
+            .project-badge-card { min-width: 100%; }
+            .table-container { overflow-x: auto; }
+            table { min-width: 760px; }
+        }
     </style>
 </head>
 <body>
@@ -241,9 +253,23 @@
         let currentErrors = [];
         let allProjects = [];
         let activeSeverityFilter = 'Tumu';
+        let refreshTimer = null;
 
         function getAuthHeaders() {
             return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken };
+        }
+
+        async function apiRequest(url, options = {}) {
+            const response = await fetch(url, options);
+            let data;
+            try { data = await response.json(); }
+            catch { data = { success: false, message: 'Sunucudan geçersiz yanıt alındı.' }; }
+            if (response.status === 401) {
+                logoutUser();
+                throw new Error('Oturumunuz sona erdi. Yeniden giriş yapın.');
+            }
+            if (!response.ok) throw new Error(data.message || `İstek başarısız (${response.status}).`);
+            return data;
         }
 
         function checkSession() {
@@ -257,268 +283,249 @@
         }
 
         function logoutUser() {
-            localStorage.clear();
+            localStorage.removeItem('pulsetrace_jwt');
+            localStorage.removeItem('pulsetrace_email');
+            localStorage.removeItem('pulsetrace_role');
             authToken = "";
             userEmail = "";
-            window.location.reload();
+            if (refreshTimer) clearInterval(refreshTimer);
+            document.getElementById('authModal').style.display = 'flex';
+            document.getElementById('userEmailDisplay').innerText = '';
+        }
+
+        function saveSession(data) {
+            authToken = data.token;
+            userEmail = data.email;
+            userRole = data.role || 'user';
+            localStorage.setItem('pulsetrace_jwt', authToken);
+            localStorage.setItem('pulsetrace_email', userEmail);
+            localStorage.setItem('pulsetrace_role', userRole);
         }
 
         function switchAuthTab(tab) {
-            document.getElementById('loginFormContainer').style.display = 'none';
-            document.getElementById('registerFormContainer').style.display = 'none';
-            document.getElementById('forgotFormContainer').style.display = 'none';
-            document.getElementById('resetFormContainer').style.display = 'none';
-            
-            if (tab === 'login') {
-                document.getElementById('tabLoginBtn').classList.add('active');
-                document.getElementById('tabRegisterBtn').classList.remove('active');
-                document.getElementById('loginFormContainer').style.display = 'flex';
-            } else if (tab === 'register') {
-                document.getElementById('tabRegisterBtn').classList.add('active');
-                document.getElementById('tabLoginBtn').classList.remove('active');
-                document.getElementById('registerFormContainer').style.display = 'flex';
-            } else if (tab === 'forgot') {
-                document.getElementById('forgotFormContainer').style.display = 'flex';
-            } else if (tab === 'reset') {
-                document.getElementById('resetFormContainer').style.display = 'flex';
-            }
+            ['loginFormContainer','registerFormContainer','forgotFormContainer','resetFormContainer']
+                .forEach(id => document.getElementById(id).style.display = 'none');
+            document.getElementById('tabLoginBtn').classList.toggle('active', tab === 'login');
+            document.getElementById('tabRegisterBtn').classList.toggle('active', tab === 'register');
+            const map = { login: 'loginFormContainer', register: 'registerFormContainer',
+                forgot: 'forgotFormContainer', reset: 'resetFormContainer' };
+            if (map[tab]) document.getElementById(map[tab]).style.display = 'flex';
         }
 
         async function handleLogin() {
             const email = document.getElementById('loginEmail').value.trim();
-            const password = document.getElementById('loginPassword').value.trim();
-            if(!email || !password) return alert('Lütfen alanları doldurun!');
-
+            const password = document.getElementById('loginPassword').value;
+            if (!email || !password) return alert('Lütfen e-posta ve şifre girin.');
             try {
-                const res = await fetch('/api/auth/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                const data = await apiRequest('/api/auth/login', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email, password })
                 });
-                const data = await res.json();
-                if (data.success) {
-                    authToken = data.token;
-                    userEmail = data.email;
-                    userRole = data.role;
-                    localStorage.setItem('pulsetrace_jwt', authToken);
-                    localStorage.setItem('pulsetrace_email', userEmail);
-                    localStorage.setItem('pulsetrace_role', userRole);
-                    document.getElementById('authModal').style.display = 'none';
-                    init();
-                } else { alert(data.message); }
-            } catch (err) { alert('Giriş hatası.'); }
+                saveSession(data);
+                document.getElementById('authModal').style.display = 'none';
+                await init();
+            } catch (err) { alert(err.message); }
         }
 
         async function handleRegister() {
             const email = document.getElementById('regEmail').value.trim();
-            const password = document.getElementById('regPassword').value.trim();
-            if(!email || !password) return alert('Lütfen alanları doldurun!');
-            if(password.length < 6) return alert('Şifre en az 6 karakter olmalıdır!');
-
+            const password = document.getElementById('regPassword').value;
+            if (!email || !password) return alert('Lütfen alanları doldurun.');
+            if (password.length < 10) return alert('Şifre en az 10 karakter olmalıdır.');
             registeredEmailTemp = email;
-
             try {
-                const res = await fetch('/api/auth/register', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                const data = await apiRequest('/api/auth/register', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email, password })
                 });
-                const data = await res.json();
-                if (data.success) {
-                    alert(data.message);
-                    // Arayüzü OTP Kod Giriş Ekranına Çevir
-                    document.getElementById('registerFormContainer').innerHTML = `
-                        <div style="color: var(--neon-green); font-size: 12px; margin-bottom: 10px;">
-                            ✉️ E-postanıza gelen 6 haneli doğrulama kodunu girin:
-                        </div>
-                        <input type="text" id="otpCodeVerify" placeholder="123456" maxlength="6" style="width: 100%; padding: 10px; letter-spacing: 3px; text-align: center; font-size: 18px;">
-                        <button class="btn" style="width: 100%; margin-top: 15px;" onclick="handleVerifyOtp()">Kodu Doğrula ve Kaydı Tamamla</button>
-                    `;
-                } else { alert(data.message); }
-            } catch (err) { alert('Kayıt isteği başarısız.'); }
+                alert(data.message);
+                document.getElementById('registerFormContainer').innerHTML = `
+                    <div style="color:var(--neon-green);font-size:12px;margin-bottom:10px">
+                        E-postanıza gelen 6 haneli kodu girin:
+                    </div>
+                    <input type="text" id="otpCodeVerify" inputmode="numeric" maxlength="6"
+                           placeholder="123456" style="width:100%;padding:10px;letter-spacing:3px;text-align:center">
+                    <button class="btn" style="width:100%;margin-top:15px" onclick="handleVerifyOtp()">
+                        Kodu Doğrula ve Kaydı Tamamla
+                    </button>`;
+            } catch (err) { alert(err.message); }
         }
 
         async function handleVerifyOtp() {
-            const code = document.getElementById('otpCodeVerify').value.trim();
-            if (!code || code.length !== 6) return alert('Lütfen 6 haneli kodu eksiksiz girin!');
-
+            const code = document.getElementById('otpCodeVerify')?.value.trim() || '';
+            if (!/^\d{6}$/.test(code)) return alert('6 haneli kodu girin.');
             try {
-                const res = await fetch('/api/auth/verify-otp', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                const data = await apiRequest('/api/auth/verify-otp', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email: registeredEmailTemp, code })
                 });
-                const data = await res.json();
-                if (data.success) {
-                    authToken = data.token;
-                    userEmail = data.email;
-                    userRole = data.role;
-                    localStorage.setItem('pulsetrace_jwt', authToken);
-                    localStorage.setItem('pulsetrace_email', userEmail);
-                    localStorage.setItem('pulsetrace_role', userRole);
-                    alert(`Hesabınız başarıyla doğrulandı!\n\nAPI Anahtarınız:\n${data.rawApiKey}`);
-                    document.getElementById('authModal').style.display = 'none';
-                    init();
-                } else { alert(data.message); }
-            } catch (err) { alert('Doğrulama hatası.'); }
+                saveSession(data);
+                alert(`Hesabınız açıldı.\n\nİlk ve varsayılan proje API anahtarınız:\n${data.rawApiKey}\n\nBu anahtar yalnızca bir kez gösterilir. Güvenli yere kaydedin.`);
+                document.getElementById('authModal').style.display = 'none';
+                await init();
+            } catch (err) { alert(err.message); }
         }
 
         async function handleForgotPassword() {
             const email = document.getElementById('forgotEmail').value.trim();
-            if(!email) return alert('E-posta girin!');
+            if (!email) return alert('E-posta girin.');
             resetEmailTarget = email;
-
             try {
-                const res = await fetch('/api/auth/forgot-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                const data = await apiRequest('/api/auth/forgot-password', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email })
                 });
-                const data = await res.json();
-                if (data.success) {
-                    alert(data.message);
-                    switchAuthTab('reset');
-                } else { alert(data.message); }
-            } catch (err) { alert('Hata oluştu.'); }
+                alert(data.message);
+                switchAuthTab('reset');
+            } catch (err) { alert(err.message); }
         }
 
         async function handleResetPassword() {
             const code = document.getElementById('resetCode').value.trim();
-            const newPassword = document.getElementById('newPassword').value.trim();
-            if(!code || !newPassword) return alert('Tüm alanları doldurun!');
-
+            const newPassword = document.getElementById('newPassword').value;
+            if (!code || !newPassword) return alert('Tüm alanları doldurun.');
             try {
-                const res = await fetch('/api/auth/reset-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                const data = await apiRequest('/api/auth/reset-password', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email: resetEmailTarget, code, newPassword })
                 });
-                const data = await res.json();
-                if (data.success) {
-                    alert(data.message);
-                    switchAuthTab('login');
-                } else { alert(data.message); }
-            } catch (err) { alert('İşlem başarısız.'); }
+                alert(data.message);
+                logoutUser();
+                switchAuthTab('login');
+            } catch (err) { alert(err.message); }
         }
 
         async function init() {
             if (!checkSession()) return;
-            await loadSubscriptionInfo();
-            await loadProjects();
-            await loadErrors();
+            try {
+                await Promise.all([loadSubscriptionInfo(), loadProjects(), loadErrors()]);
+                if (refreshTimer) clearInterval(refreshTimer);
+                refreshTimer = setInterval(() => {
+                    if (authToken) loadErrors().catch(err => console.error(err));
+                }, 20000);
+            } catch (err) { console.error(err); }
         }
 
         async function loadSubscriptionInfo() {
-            try {
-                const res = await fetch('/api/user/subscription', { headers: getAuthHeaders() });
-                if (res.ok) {
-                    const sub = await res.json();
-                    document.getElementById('planBadgeText').innerText = sub.plan_type.toUpperCase();
-                    document.getElementById('quotaText').innerText = `Aylık Kullanım: ${sub.monthly_error_count} / ${sub.error_limit} Hata Raporu`;
-                    const percent = Math.min(Math.round((sub.monthly_error_count / sub.error_limit) * 100), 100);
-                    document.getElementById('quotaBarFill').style.width = percent + '%';
-                    document.getElementById('quotaPercentText').innerText = `%${percent} Kullanıldı`;
-                } else if(res.status === 401) { logoutUser(); }
-            } catch (err) { console.error(err); }
+            const sub = await apiRequest('/api/user/subscription', { headers: getAuthHeaders() });
+            document.getElementById('planBadgeText').innerText = String(sub.plan_type || 'free').toUpperCase();
+            const used = Number(sub.monthly_error_count || 0);
+            const limit = Math.max(Number(sub.error_limit || 0), 1);
+            document.getElementById('quotaText').innerText = `Aylık Kullanım: ${used.toLocaleString('tr-TR')} / ${limit.toLocaleString('tr-TR')} Hata Raporu`;
+            const percent = Math.min(Math.round((used / limit) * 100), 100);
+            document.getElementById('quotaBarFill').style.width = percent + '%';
+            document.getElementById('quotaPercentText').innerText = `%${percent} Kullanıldı`;
         }
 
         async function loadProjects() {
-            try {
-                const res = await fetch('/api/projects', { headers: getAuthHeaders() });
-                if(res.status === 401) { logoutUser(); return; }
-                allProjects = await res.json();
-                
-                const select = document.getElementById('projectSelect');
-                const container = document.getElementById('projectListContainer');
-                let optionsHTML = '<option value="">Tüm Projelerim</option>';
-                let cardsHTML = '';
+            const projects = await apiRequest('/api/projects', { headers: getAuthHeaders() });
+            allProjects = Array.isArray(projects) ? projects : [];
+            const select = document.getElementById('projectSelect');
+            const previous = select.value;
+            const container = document.getElementById('projectListContainer');
+            select.innerHTML = '<option value="">Tüm Projelerim</option>';
+            container.innerHTML = '';
 
-                allProjects.forEach(p => {
-                    optionsHTML += `<option value="${p.id}">${escapeHtml(p.name)}</option>`;
-                    cardsHTML += `
-                        <div class="project-badge-card">
-                            <div style="color: #fff; font-weight: bold; margin-bottom: 6px;">📂 ${escapeHtml(p.name)}</div>
-                            <div style="color: var(--text-muted); font-size: 11px;">API Anahtarı (Maskelenmiş):</div>
-                            <div class="api-key-box">
-                                <input type="text" value="${p.apiKey}" readonly style="border:none; background:transparent; color: var(--neon-green); width: 100%; font-size: 11px;">
-                                <button class="btn btn-secondary" style="padding: 4px 8px; font-size: 10px;" onclick="navigator.clipboard.writeText('${p.apiKey}'); alert('Kopyalandı!');">Kopyala</button>
-                            </div>
-                        </div>
-                    `;
-                });
+            allProjects.forEach(project => {
+                const option = document.createElement('option');
+                option.value = project.id;
+                option.textContent = project.name;
+                select.appendChild(option);
 
-                select.innerHTML = optionsHTML;
-                container.innerHTML = cardsHTML;
-            } catch (err) { console.error(err); }
+                const card = document.createElement('div');
+                card.className = 'project-badge-card';
+                const title = document.createElement('div');
+                title.style.cssText = 'color:#fff;font-weight:bold;margin-bottom:6px';
+                title.textContent = `📂 ${project.name}`;
+                const label = document.createElement('div');
+                label.style.cssText = 'color:var(--text-muted);font-size:11px';
+                label.textContent = 'API Anahtarı (maskelenmiş):';
+                const keyBox = document.createElement('div');
+                keyBox.className = 'api-key-box';
+                const keyText = document.createElement('span');
+                keyText.style.cssText = 'color:var(--neon-green);font-size:11px;flex:1';
+                keyText.textContent = project.apiKey;
+                const rotate = document.createElement('button');
+                rotate.className = 'btn btn-secondary';
+                rotate.style.cssText = 'padding:4px 8px;font-size:10px';
+                rotate.textContent = 'Yenile';
+                rotate.onclick = () => rotateProjectKey(project.id);
+                const remove = document.createElement('button');
+                remove.className = 'btn btn-warning';
+                remove.style.cssText = 'padding:4px 8px;font-size:10px';
+                remove.textContent = 'Sil';
+                remove.onclick = () => deleteProject(project.id, project.name);
+                keyBox.append(keyText, rotate, remove);
+                card.append(title, label, keyBox);
+                container.appendChild(card);
+            });
+            if ([...select.options].some(o => o.value === previous)) select.value = previous;
         }
 
         async function loadErrors() {
-            if(!checkSession()) return;
+            if (!checkSession()) return;
             const selectedProj = document.getElementById('projectSelect').value;
-            let url = '/api/errors';
-            if (selectedProj) url += '?projectId=' + selectedProj;
-
-            try {
-                const res = await fetch(url, { headers: getAuthHeaders() });
-                if(res.status === 401) { logoutUser(); return; }
-                currentErrors = await res.json();
-                filterAndRenderErrors();
-                renderTimeline();
-            } catch (err) { console.error(err); }
+            const url = '/api/errors?limit=500' + (selectedProj ? '&projectId=' + encodeURIComponent(selectedProj) : '');
+            const data = await apiRequest(url, { headers: getAuthHeaders() });
+            currentErrors = Array.isArray(data) ? data : [];
+            filterAndRenderErrors();
+            renderTimeline();
         }
 
-        function escapeHtml(str) {
-            if (!str) return '';
-            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, char => ({
+                '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#039;'
+            })[char]);
         }
 
-        function setSeverityFilter(sev, el) {
-            document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
-            el.classList.add('active');
-            activeSeverityFilter = sev;
+        function setSeverityFilter(severity, element) {
+            document.querySelectorAll('.filter-chip').forEach(chip => chip.classList.remove('active'));
+            element.classList.add('active');
+            activeSeverityFilter = severity;
             filterAndRenderErrors();
         }
 
         function filterAndRenderErrors() {
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-            let totalActive = currentErrors.filter(e => e.status === 'Aktif').length;
-            let criticals = currentErrors.filter(e => e.status === 'Aktif' && e.level === 'Kritik').length;
-            let affected = currentErrors.filter(e => e.status === 'Aktif').reduce((acc, curr) => acc + curr.affected_users, 0);
-            let resolved = currentErrors.filter(e => e.status === 'Çözüldü').length;
+            const searchTerm = (document.getElementById('searchInput').value || '').toLocaleLowerCase('tr-TR');
+            const active = currentErrors.filter(e => e.status === 'Aktif');
+            const critical = active.filter(e => e.level === 'Kritik');
+            const resolved = currentErrors.filter(e => e.status === 'Çözüldü');
+            const uniqueUsers = new Set();
+            currentErrors.forEach(e => {
+                // Backend'de hata başına tekil kullanıcı sayısı tutulur; bu kart toplam etkilenen kayıt sayısını gösterir.
+                for (let i = 0; i < Number(e.affected_users || 0); i++) uniqueUsers.add(`${e.id}:${i}`);
+            });
+            document.getElementById('totalCount').innerText = active.length;
+            document.getElementById('criticalCount').innerText = critical.length;
+            document.getElementById('affectedCount').innerText = [...uniqueUsers].length;
+            document.getElementById('resolvedCount').innerText = resolved.length;
 
-            document.getElementById('totalCount').innerText = totalActive;
-            document.getElementById('criticalCount').innerText = criticals;
-            document.getElementById('affectedCount').innerText = affected;
-            document.getElementById('resolvedCount').innerText = resolved;
-
-            let filtered = currentErrors.filter(item => 
-                item.message.toLowerCase().includes(searchTerm) || 
-                item.url.toLowerCase().includes(searchTerm)
+            let filtered = currentErrors.filter(item =>
+                String(item.message || '').toLocaleLowerCase('tr-TR').includes(searchTerm) ||
+                String(item.url || '').toLocaleLowerCase('tr-TR').includes(searchTerm)
             );
-
             if (activeSeverityFilter === 'Kritik') filtered = filtered.filter(e => e.level === 'Kritik' && e.status === 'Aktif');
             else if (activeSeverityFilter === 'Uyari') filtered = filtered.filter(e => e.level === 'Uyari' && e.status === 'Aktif');
             else if (activeSeverityFilter === 'Cozuldu') filtered = filtered.filter(e => e.status === 'Çözüldü');
-            else if (activeSeverityFilter === 'Tumu') filtered = filtered.filter(e => e.status === 'Aktif');
+            else filtered = filtered.filter(e => e.status === 'Aktif');
 
             document.getElementById('filteredCount').innerText = filtered.length;
             const tbody = document.getElementById('errorTableBody');
             tbody.innerHTML = '';
-
             filtered.forEach(item => {
                 const tr = document.createElement('tr');
                 const levelClass = item.level === 'Kritik' ? 'level-kritik' : 'level-uyari';
-                const statusBadge = item.status === 'Aktif' ? '<span class="status-aktif">Aktif</span>' : '<span class="status-cozuldu">Çözüldü</span>';
-                
+                const statusBadge = item.status === 'Aktif'
+                    ? '<span class="status-aktif">Aktif</span>'
+                    : '<span class="status-cozuldu">Çözüldü</span>';
                 tr.innerHTML = `
-                    <td>#${escapeHtml(String(item.id))}</td>
+                    <td>#${escapeHtml(item.id)}</td>
                     <td>${escapeHtml(item.project)}</td>
                     <td class="${levelClass}">${escapeHtml(item.level)}</td>
-                    <td style="color: #fff;">${escapeHtml(item.message)}</td>
-                    <td><span style="color:var(--info); font-weight:bold;">${escapeHtml(String(item.count))}x</span></td>
-                    <td>${escapeHtml(String(item.affected_users))} tekil</td>
-                    <td>${statusBadge}</td>
-                `;
+                    <td style="color:#fff">${escapeHtml(item.message)}</td>
+                    <td><span style="color:var(--info);font-weight:bold">${escapeHtml(item.count)}x</span></td>
+                    <td>${escapeHtml(item.affected_users)} tekil</td>
+                    <td>${statusBadge}</td>`;
                 tr.onclick = () => openModal(item.id);
                 tbody.appendChild(tr);
             });
@@ -527,73 +534,106 @@
         function renderTimeline() {
             const container = document.getElementById('timelineContainer');
             container.innerHTML = '';
-            const timeMap = {};
-            currentErrors.forEach(e => {
-                const hour = e.last_seen ? e.last_seen.substring(0, 5) : "00:00";
-                timeMap[hour] = (timeMap[hour] || 0) + e.count;
-            });
-            const keys = Object.keys(timeMap).sort();
-            if(keys.length === 0) {
-                container.innerHTML = '<div style="color:var(--text-muted); font-size:12px; font-family:JetBrains Mono;">Henüz veri yok.</div>';
-                return;
+            const buckets = new Map();
+            const now = Date.now();
+            for (let hourOffset = 23; hourOffset >= 0; hourOffset--) {
+                const d = new Date(now - hourOffset * 3600000);
+                const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}-${d.getHours()}`;
+                buckets.set(key, { label: d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }), count: 0 });
             }
-            keys.forEach(h => {
-                const count = timeMap[h];
-                container.innerHTML += `
-                    <div class="timeline-bar-wrapper">
-                        <div class="timeline-bar" style="height: ${Math.min(count * 15, 65)}px;" title="${h} - ${count} hata">${count}</div>
-                        <span class="timeline-label" style="font-size:10px; color:var(--text-muted);">${h}</span>
-                    </div>
-                `;
+            currentErrors.forEach(error => {
+                const date = new Date(error.last_seen || error.timestamp || '');
+                if (Number.isNaN(date.getTime())) return;
+                const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}-${date.getHours()}`;
+                if (buckets.has(key)) buckets.get(key).count += Number(error.count || 0);
+            });
+            const values = [...buckets.values()];
+            const max = Math.max(1, ...values.map(v => v.count));
+            values.forEach(bucket => {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'timeline-bar-wrapper';
+                const bar = document.createElement('div');
+                bar.className = 'timeline-bar';
+                bar.style.height = `${Math.max(2, Math.round(bucket.count / max * 65))}px`;
+                bar.title = `${bucket.label} - ${bucket.count} olay`;
+                bar.textContent = bucket.count ? String(bucket.count) : '';
+                const label = document.createElement('span');
+                label.className = 'timeline-label';
+                label.style.cssText = 'font-size:10px;color:var(--text-muted)';
+                label.textContent = bucket.label;
+                wrapper.append(bar, label);
+                container.appendChild(wrapper);
             });
         }
 
         async function createProject() {
-            const nameInput = document.getElementById('newProjectName');
-            if(!nameInput.value.trim()) return alert('Proje adı girin!');
-            
-            const res = await fetch('/api/projects', {
-                method: 'POST',
-                headers: getAuthHeaders(),
-                body: JSON.stringify({ name: nameInput.value })
-            });
-            const data = await res.json();
-            if(data.success) {
-                nameInput.value = '';
-                alert(`Proje oluşturuldu!\n\nAPI Anahtarınız:\n${data.project.apiKey}`);
-                loadProjects();
-            } else { alert(data.message); }
+            const input = document.getElementById('newProjectName');
+            const name = input.value.trim();
+            if (!name) return alert('Proje adı girin.');
+            try {
+                const data = await apiRequest('/api/projects', {
+                    method: 'POST', headers: getAuthHeaders(), body: JSON.stringify({ name })
+                });
+                input.value = '';
+                alert(`Proje oluşturuldu.\n\nAPI ANAHTARI (yalnızca bir kez):\n${data.project.apiKey}\n\nBu anahtarı şimdi güvenli yere kaydedin.`);
+                await loadProjects();
+            } catch (err) { alert(err.message); }
+        }
+
+        async function rotateProjectKey(projectId) {
+            if (!confirm('Eski API anahtarı hemen geçersiz olacak. Devam edilsin mi?')) return;
+            try {
+                const data = await apiRequest(`/api/projects/${projectId}/rotate-key`, {
+                    method: 'POST', headers: getAuthHeaders()
+                });
+                alert(`Yeni API anahtarınız:\n${data.apiKey}\n\nBu anahtarı güvenli yere kaydedin.`);
+                await loadProjects();
+            } catch (err) { alert(err.message); }
+        }
+
+        async function deleteProject(projectId, projectName) {
+            if (!confirm(`"${projectName}" projesini devre dışı bırakmak istiyor musunuz?`)) return;
+            try {
+                await apiRequest(`/api/projects/${projectId}`, { method: 'DELETE', headers: getAuthHeaders() });
+                await Promise.all([loadProjects(), loadErrors()]);
+            } catch (err) { alert(err.message); }
         }
 
         function openModal(id) {
-            const err = currentErrors.find(e => e.id === id);
-            if(!err) return;
-            document.getElementById('modalTitle').innerText = 'Hata Detayı #' + err.id;
-            
-            const modalBody = document.getElementById('modalBody');
-            modalBody.innerHTML = `
-                <div class="modal-row"><span class="modal-label">Seviye:</span><span>${err.level}</span></div>
-                <div class="modal-row"><span class="modal-label">Tekrar:</span><span>${err.count} Kez</span></div>
-                <div class="modal-row"><span class="modal-label">Endpoint:</span><span>${err.url}</span></div>
-                <div><span class="modal-label">Stack Trace:</span><div class="stack-trace">${escapeHtml(err.stack)}</div></div>
-            `;
-
+            const error = currentErrors.find(item => Number(item.id) === Number(id));
+            if (!error) return;
+            document.getElementById('modalTitle').innerText = 'Hata Detayı #' + error.id;
+            const body = document.getElementById('modalBody');
+            body.innerHTML = `
+                <div class="modal-row"><span class="modal-label">Seviye:</span><span>${escapeHtml(error.level)}</span></div>
+                <div class="modal-row"><span class="modal-label">Tekrar:</span><span>${escapeHtml(error.count)} kez</span></div>
+                <div class="modal-row"><span class="modal-label">Endpoint:</span><span>${escapeHtml(error.url || '-')}</span></div>
+                <div class="modal-row"><span class="modal-label">Ortam:</span><span>${escapeHtml(error.environment || '-')}</span></div>
+                <div class="modal-row"><span class="modal-label">Sürüm:</span><span>${escapeHtml(error.release || '-')}</span></div>
+                <div><span class="modal-label">Stack Trace:</span><div class="stack-trace">${escapeHtml(error.stack || 'Stack trace gönderilmemiş.')}</div></div>`;
             const resolveBtn = document.getElementById('resolveBtn');
-            if(err.status === 'Aktif') {
+            if (error.status === 'Aktif') {
                 resolveBtn.style.display = 'inline-block';
                 resolveBtn.onclick = async () => {
-                    await fetch('/api/errors/' + err.id + '/resolve', { method: 'PATCH', headers: getAuthHeaders() });
-                    closeModal();
-                    loadErrors();
+                    try {
+                        await apiRequest(`/api/errors/${error.id}/resolve`, {
+                            method: 'PATCH', headers: getAuthHeaders()
+                        });
+                        closeModal();
+                        await loadErrors();
+                    } catch (err) { alert(err.message); }
                 };
-            } else { resolveBtn.style.display = 'none'; }
+            } else {
+                resolveBtn.style.display = 'none';
+            }
             document.getElementById('errorModal').style.display = 'flex';
         }
 
-        function closeModal() { document.getElementById('errorModal').style.display = 'none'; }
+        function closeModal() {
+            document.getElementById('errorModal').style.display = 'none';
+        }
 
         init();
-        setInterval(loadErrors, 6000);
     </script>
 </body>
 </html>
