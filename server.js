@@ -137,15 +137,24 @@ app.use((req, res, next) => {
 
 app.use(cors({
     origin(origin, callback) {
-        // Aynı origin isteklerinde Origin olmayabilir. CORS_ORIGINS boşsa
-        // cross-origin tarayıcı erişimi kapalı tutulur.
+        const allowedOrigins = [
+            'https://pulsetrace-pro.onrender.com'
+        ];
+
+        // Sunucu tarafı isteklerine izin ver
         if (!origin) return callback(null, true);
-        if (allowedOrigins.includes(origin)) return callback(null, true);
+
+        if (allowedOrigins.includes(origin.replace(/\/$/, ''))) {
+            return callback(null, true);
+        }
+
+        console.error('Engellenen CORS origin:', origin);
         return callback(new Error('CORS origin not allowed'));
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
 }));
+
 app.use(express.json({ limit: '256kb' }));
 
 const rateBuckets = new Map();
