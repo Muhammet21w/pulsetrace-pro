@@ -404,7 +404,6 @@ function rateLimit({
 
         let item = rateBuckets.get(key);
 
-        // In-memory limiter için bellek büyümesini sınırla. Çoklu instance için Redis gerekir.
         if (!item && rateBuckets.size > 50000) {
             for (const [bucketKey, bucket] of rateBuckets) {
                 if (bucket.resetAt <= now) rateBuckets.delete(bucketKey);
@@ -974,7 +973,7 @@ app.post(
         } catch (err) {
             if (err.message === 'TRIAL_ALREADY_CLAIMED') {
                 db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
-                return sendError(res, 409, 'Bu tarayıcı cihazında daha önce deneme hesabı oluşturulmuş. Mevcut hesabınıza giriş yapın. Cihaz verisi temizlenirse bu kontrol aşılabilir; kesin kişi doğrulaması için SMS sağlayıcısı gerekir.');
+                return sendError(res, 409, 'Bu tarayıcı cihazında daha önce deneme hesabı oluşturulmuş. Mevcut hesabınıza giriş yapın.');
             }
             console.error('OTP verification error:', err.message);
             sendError(res, 500, 'Hesap oluşturulamadı. Lütfen tekrar deneyin.');
@@ -1362,7 +1361,6 @@ app.post(
             formData.append('test_mode', testMode);
             formData.append('lang', 'tr');
 
-            // Önce bekleyen siparişi kaydet.
             db.prepare(`
                 INSERT INTO payment_orders (
                     merchant_oid,
@@ -1529,12 +1527,9 @@ app.post(
                     'PayTR callback siparişi bulunamadı:',
                     merchantOid
                 );
-
-                // İmza geçerli. PayTR'nin gereksiz tekrar göndermesini önle.
                 return res.status(200).send('OK');
             }
 
-            // Daha önce işlenen bildirim tekrar gelirse yeniden üyelik ekleme.
             if (order.status !== 'pending') {
                 return res.status(200).send('OK');
             }
@@ -1545,15 +1540,6 @@ app.post(
                 !Number.isSafeInteger(receivedAmount) ||
                 receivedAmount !== Number(order.amount_kurus)
             ) {
-                console.error(
-                    'PayTR tutar uyuşmazlığı:',
-                    merchantOid,
-                    'Beklenen:',
-                    order.amount_kurus,
-                    'Gelen:',
-                    totalAmount
-                );
-
                 db.prepare(`
                     UPDATE payment_orders
                     SET status = 'amount_mismatch'
@@ -1572,22 +1558,12 @@ app.post(
                     AND status = 'pending'
                 `).run(merchantOid);
 
-                console.log(
-                    '[PAYTR] Ödeme başarısız:',
-                    merchantOid
-                );
-
                 return res.status(200).send('OK');
             }
 
             const plan = PLANS[order.plan];
 
             if (!plan || !['starter', 'pro'].includes(order.plan)) {
-                console.error(
-                    'PayTR siparişinde geçersiz paket:',
-                    merchantOid
-                );
-
                 db.prepare(`
                     UPDATE payment_orders
                     SET status = 'invalid_plan'
@@ -1606,11 +1582,6 @@ app.post(
             `).get(order.user_id);
 
             if (!subscription) {
-                console.error(
-                    'Ödeme kullanıcısı bulunamadı:',
-                    merchantOid
-                );
-
                 db.prepare(`
                     UPDATE payment_orders
                     SET status = 'user_missing'
@@ -1634,7 +1605,6 @@ app.post(
                 startTime + SUBSCRIPTION_DAYS * 24 * 60 * 60 * 1000
             ).toISOString();
 
-            // Sipariş onayı ve üyelik yükseltme tek transaction içinde.
             db.transaction(() => {
                 const updateOrder = db.prepare(`
                     UPDATE payment_orders
@@ -1648,7 +1618,6 @@ app.post(
                     merchantOid
                 );
 
-                // Aynı ödeme ikinci defa işlenmesin.
                 if (!updateOrder.changes) {
                     return;
                 }
