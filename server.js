@@ -6,7 +6,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
-const nodemailer = require('nodemailer'); // <-- Brevo SMTP için eklendi
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -38,7 +38,7 @@ db.exec(`
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- Geçici OTP Doğrulama Tablosu (E-posta doğrulanana kadar burada tutulur)
+    -- Geçici OTP Doğrulama Tablosu
     CREATE TABLE IF NOT EXISTS pending_registrations (
         email TEXT PRIMARY KEY,
         password_hash TEXT NOT NULL,
@@ -95,7 +95,7 @@ db.exec(`
     );
 `);
 
-// Brevo SMTP Aktarıcısı (Render Environment Variables'dan okur)
+// Brevo SMTP Aktarıcısı
 const transporter = nodemailer.createTransport({
     host: 'smtp-relay.brevo.com',
     port: 587,
@@ -124,7 +124,7 @@ function verifyJwtSession(req, res, next) {
     }
 }
 
-// 1. AŞAMA: Kayıt Ol ve E-postaya OTP Kodu Gönder
+// 1. AŞAMA: Kayıt Talebi ve E-postaya OTP Kodu Gönderme
 app.post('/api/auth/register', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ success: false, message: "E-posta ve şifre zorunludur." });
@@ -133,13 +133,11 @@ app.post('/api/auth/register', async (req, res) => {
         return res.status(400).json({ success: false, message: "Şifre en az 6 karakter uzunluğunda olmalıdır!" });
     }
 
-    // E-posta daha önce asıl kullanıcılara kayıtlı mı kontrol et
     const existingUser = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
     if (existingUser) {
         return res.status(400).json({ success: false, message: "Bu e-posta adresi zaten kullanımda." });
     }
 
-    // 6 haneli rastgele OTP kodu üret (5 dakika geçerli)
     const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
@@ -147,13 +145,11 @@ app.post('/api/auth/register', async (req, res) => {
         const saltRounds = 12;
         const passwordHash = await bcrypt.hash(password, saltRounds);
 
-        // Geçici kayıt tablosuna kaydet
         db.prepare(`
             INSERT OR REPLACE INTO pending_registrations (email, password_hash, otp_code, expires_at) 
             VALUES (?, ?, ?, ?)
         `).run(email, passwordHash, otpCode, expiresAt);
 
-        // Brevo SMTP üzerinden e-posta gönder
         await transporter.sendMail({
             from: '"PulseTrace Pro" <noreply@pulsetrace.com>',
             to: email,
@@ -164,11 +160,11 @@ app.post('/api/auth/register', async (req, res) => {
         res.json({ success: true, message: "Doğrulama kodu e-posta adresinize gönderildi. Lütfen kodu girin." });
     } catch (err) {
         console.error("Kayıt ve E-posta Gönderme Hatası:", err);
-        res.status(500).json({ success: false, message: "E-posta gönderilemedi. Lütfen SMTP ayarlarını kontrol edin." });
+        res.status(500).json({ success: false, message: "E-posta gönderilemedi. Lütfen Brevo SMTP ayarlarını kontrol edin." });
     }
 });
 
-// 2. AŞAMA: OTP Kodunu Doğrula ve Hesabı Aktifleştir (Varsayılan Proje Oluşturulur)
+// 2. AŞAMA: OTP Kodunu Doğrulama ve Hesabı Açma
 app.post('/api/auth/verify-otp', async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) {
@@ -195,11 +191,9 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
     try {
         const result = db.transaction(() => {
-            // Asıl kullanıcıyı oluştur
             const info = db.prepare('INSERT INTO users (email, password_hash, plan_type, error_limit, role, trial_ends_at) VALUES (?, ?, ?, ?, ?, ?)')
                 .run(email, pending.password_hash, planType, limit, 'user', trialEndsAt);
             
-            // Varsayılan proje oluştur
             const rawKey = "pt_live_" + crypto.randomBytes(16).toString('hex');
             const keyHash = crypto.createHash('sha256').update(rawKey).digest('hex');
             const keyPrefix = rawKey.substring(0, 10) + "...";
@@ -207,7 +201,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             db.prepare('INSERT INTO projects (user_id, name, api_key_hash, api_key_prefix) VALUES (?, ?, ?, ?)')
                 .run(info.lastInsertRowid, 'Varsayılan Proje', keyHash, keyPrefix);
 
-            // Geçici kaydı temizle
             db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
 
             return { userId: info.lastInsertRowid, rawApiKey: rawKey };
@@ -235,7 +228,7 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ success: true, token, userId: user.id, email: user.email, plan: user.plan_type, role: user.role });
 });
 
-// Şifre Sıfırlama Kodu İsteme (ForgotPassword)
+// Şifre Sıfırlama İstemi
 app.post('/api/auth/forgot-password', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: "E-posta adresi gereklidir." });
@@ -264,7 +257,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     }
 });
 
-// Şifre Sıfırlama / Güncelleme (Reset Password)
+// Şifre Güncelleme
 app.post('/api/auth/reset-password', async (req, res) => {
     const { email, code, newPassword } = req.body;
     if (!email || !code || !newPassword) {
@@ -295,74 +288,11 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 app.get('/api/user/subscription', verifyJwtSession, (req, res) => {
     const user = db.prepare('SELECT email, plan_type, monthly_error_count, error_limit, role, trial_ends_at FROM users WHERE id = ?').get(req.user.id);
-    
     let trialExpired = false;
     if (user.trial_ends_at) {
         trialExpired = new Date() > new Date(user.trial_ends_at);
     }
-
     res.json({ ...user, trialExpired });
-});
-
-app.post('/api/user/upgrade', verifyJwtSession, (req, res) => {
-    const { plan } = req.body;
-    if (!plan || (plan !== 'pro' && plan !== 'enterprise' && plan !== 'free')) {
-        return res.status(400).json({ success: false, message: "Geçersiz paket seçimi." });
-    }
-
-    let limit = plan === 'pro' ? 50000 : (plan === 'enterprise' ? 999999 : 3000);
-
-    try {
-        db.prepare('UPDATE users SET plan_type = ?, error_limit = ? WHERE id = ?').run(plan, limit, req.user.id);
-        res.json({ success: true, message: "Paket başarıyla güncellendi." });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
-app.post('/api/payment/notify', verifyJwtSession, (req, res) => {
-    const { plan, amount, method, note } = req.body;
-    if (!plan || !amount) return res.status(400).json({ success: false, message: "Eksik bilgi." });
-
-    try {
-        db.prepare('INSERT INTO payment_notifications (user_id, plan, amount, method, note) VALUES (?, ?, ?, ?, ?)')
-            .run(req.user.id, plan, amount, method || 'Havale/EFT', note || '');
-        res.json({ success: true, message: "Ödeme bildiriminiz alındı. Admin onayından sonra paketiniz aktif edilecektir." });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
-app.get('/api/admin/payments', verifyJwtSession, (req, res) => {
-    if (req.user.role !== 'admin') return res.status(403).json({ success: false, message: "Yetkisiz erişim." });
-    
-    const payments = db.prepare(`
-        SELECT p.*, u.email as user_email 
-        FROM payment_notifications p 
-        JOIN users u ON p.user_id = u.id 
-        ORDER BY p.id DESC
-    `).all();
-    res.json(payments);
-});
-
-app.post('/api/admin/payments/:id/approve', verifyJwtSession, (req, res) => {
-    if (req.user.role !== 'admin') return res.status(403).json({ success: false, message: "Yetkisiz erişim." });
-    
-    const paymentId = parseInt(req.params.id);
-    const payment = db.prepare('SELECT * FROM payment_notifications WHERE id = ?').get(paymentId);
-    if (!payment) return res.status(404).json({ success: false, message: "Bildirim bulunamadı." });
-
-    let limit = payment.plan === 'pro' ? 50000 : (payment.plan === 'enterprise' ? 999999 : 3000);
-
-    try {
-        db.transaction(() => {
-            db.prepare('UPDATE users SET plan_type = ?, error_limit = ? WHERE id = ?').run(payment.plan, limit, payment.user_id);
-            db.prepare("UPDATE payment_notifications SET status = 'Onaylandı' WHERE id = ?").run(paymentId);
-        })();
-        res.json({ success: true, message: "Ödeme onaylandı ve kullanıcının paketi yükseltildi." });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
 });
 
 app.get('/api/projects', verifyJwtSession, (req, res) => {
@@ -404,69 +334,6 @@ app.get('/api/errors', verifyJwtSession, (req, res) => {
     res.json(db.prepare(`SELECT ${query}`).all(...params));
 });
 
-app.post('/api/report', async (req, res) => {
-    const rawApiKey = req.headers['x-api-key'];
-    if (!rawApiKey) return res.status(401).json({ success: false, message: "API Key eksik." });
-
-    const apiKeyHash = crypto.createHash('sha256').update(rawApiKey).digest('hex');
-    const project = db.prepare('SELECT * FROM projects WHERE api_key_hash = ?').get(apiKeyHash);
-    if (!project) return res.status(401).json({ success: false, message: "Geçersiz API Key!" });
-
-    const user = db.prepare('SELECT id, monthly_error_count, error_limit, trial_ends_at, plan_type FROM users WHERE id = ?').get(project.user_id);
-    
-    if (user.plan_type === 'free' && user.trial_ends_at && new Date() > new Date(user.trial_ends_at)) {
-        return res.status(403).json({ success: false, message: "7 günlük deneme süreniz dolmuştur. Lütfen paketinizi yükseltin." });
-    }
-
-    if (user.monthly_error_count >= user.error_limit) {
-        return res.status(429).json({ success: false, message: "Aylık hata raporlama limiti doldu (429 Too Many Requests)." });
-    }
-
-    const errorMsg = req.body.message || "Bilinmeyen hata";
-    const errorStack = req.body.stack || "Stack trace yok";
-    const level = req.body.level || "Kritik";
-    const url = req.body.url || "/";
-    const clientUuid = req.body.clientUuid || "anonim-user-" + Math.random();
-    const fingerprint = crypto.createHash('md5').update(errorMsg + errorStack).digest('hex');
-    const nowTime = new Date().toLocaleTimeString();
-
-    try {
-        const result = db.transaction(() => {
-            db.prepare('UPDATE users SET monthly_error_count = monthly_error_count + 1 WHERE id = ?').run(user.id);
-
-            const existingError = db.prepare('SELECT * FROM errors WHERE project_id = ? AND fingerprint = ? AND status = ?').get(project.id, fingerprint, 'Aktif');
-
-            if (existingError) {
-                const clientExists = db.prepare('SELECT * FROM error_clients WHERE error_id = ? AND client_uuid = ?').get(existingError.id, clientUuid);
-                let newAffectedCount = existingError.affected_users;
-
-                if (!clientExists) {
-                    db.prepare('INSERT INTO error_clients (error_id, client_uuid) VALUES (?, ?)').run(existingError.id, clientUuid);
-                    newAffectedCount += 1;
-                }
-
-                db.prepare('UPDATE errors SET count = count + 1, affected_users = ?, last_seen = ? WHERE id = ?')
-                    .run(newAffectedCount, nowTime, existingError.id);
-
-                return { errorId: existingError.id, action: "updated" };
-            }
-
-            const info = db.prepare(`
-                INSERT INTO errors (project_id, level, status, message, stack, url, ip, browser, fingerprint, count, affected_users, first_seen, last_seen)
-                VALUES (?, ?, 'Aktif', ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
-            `).run(project.id, level, errorMsg, errorStack, url, req.ip || "127.0.0.1", req.body.browser || "SDK", fingerprint, nowTime, nowTime);
-
-            db.prepare('INSERT INTO error_clients (error_id, client_uuid) VALUES (?, ?)').run(info.lastInsertRowid, clientUuid);
-
-            return { errorId: info.lastInsertRowid, action: "created" };
-        })();
-
-        res.json({ success: true, ...result });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
 app.patch('/api/errors/:id/resolve', verifyJwtSession, (req, res) => {
     const id = parseInt(req.params.id);
     const errorCheck = db.prepare(`
@@ -482,5 +349,5 @@ app.patch('/api/errors/:id/resolve', verifyJwtSession, (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log("[PulseTrace Enterprise] Brevo SMTP ve OTP Doğrulama Modüllü Sunucu aktif: http://localhost:" + PORT);
+    console.log("[PulseTrace Enterprise] Sunucu aktif: http://localhost:" + PORT);
 });
