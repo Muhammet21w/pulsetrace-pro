@@ -21,10 +21,11 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
         console.error('FATAL: Production ortamında en az 32 karakterlik JWT_SECRET zorunludur.');
         process.exit(1);
     }
-    console.warn('UYARI: JWT_SECRET ayarlanmamış veya kısa. Yerel test için geçici anahtar kullanılıyor.');
+    console.warn('UYARI: JWT_SECRET ayarlanmamış veya kısa.');
 }
 
 const SIGNING_SECRET = JWT_SECRET || crypto.randomBytes(48).toString('hex');
+
 const DB_PATH = path.join(__dirname, 'pulsetrace_enterprise.db');
 const db = new Database(DB_PATH);
 
@@ -32,17 +33,84 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 
-function addColumnIfMissing(table, column, definition) {
-    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+// Render proxy IP bilgisini doğru almak için.
+app.set('trust proxy', 1);
 
-    if (!columns.some(c => c.name === column)) {
-        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-        console.log(`[DB MIGRATION] ${table}.${column} sütunu eklendi.`);
+// =====================================================
+// PAKETLER
+// =====================================================
+
+const PLANS = {
+    free: {
+        name: 'Free',
+        amount: 0,
+        errorLimit: 3000,
+        projectLimit: 3
+    },
+    starter: {
+        name: 'Starter',
+        amount: 7990,
+        errorLimit: 10000,
+        projectLimit: 10
+    },
+    pro: {
+        name: 'Pro',
+        amount: 14990,
+        errorLimit: 50000,
+        projectLimit: 50
     }
+};
+
+const SUBSCRIPTION_DAYS = 30;
+
+// =====================================================
+// VERİTABANI MIGRATION SİSTEMİ
+// =====================================================
+
+function tableExists(table) {
+    return Boolean(
+        db.prepare(`
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+        `).get(table)
+    );
+}
+
+function addColumnIfMissing(table, column, definition) {
+    if (!tableExists(table)) {
+        console.warn(`[DB MIGRATION] ${table} tablosu bulunamadı.`);
+        return false;
+    }
+
+    const columns = db.prepare(`PRAGMA table_info("${table}")`).all();
+
+    if (columns.some(col => col.name === column)) {
+        return false;
+    }
+
+    db.exec(`ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition}`);
+
+    console.log(`[DB MIGRATION] ${table}.${column} eklendi.`);
+    return true;
+}
+
+function backfillDateColumn(table, column) {
+    if (!tableExists(table)) return;
+
+    const columns = db.prepare(`PRAGMA table_info("${table}")`).all();
+
+    if (!columns.some(col => col.name === column)) return;
+
+    db.prepare(`
+        UPDATE "${table}"
+        SET "${column}" = CURRENT_TIMESTAMP
+        WHERE "${column}" IS NULL OR "${column}" = ''
+    `).run();
 }
 
 // =====================================================
-// VERİTABANI TABLOLARI
+// TABLOLAR
 // =====================================================
 
 db.exec(`
@@ -55,8 +123,11 @@ CREATE TABLE IF NOT EXISTS users (
     error_limit INTEGER DEFAULT 3000,
     role TEXT DEFAULT 'user',
     trial_ends_at TEXT,
+    subscription_ends_at TEXT,
     reset_code TEXT,
     reset_code_expires TEXT,
+    usage_month TEXT,
+    token_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -64,7 +135,9 @@ CREATE TABLE IF NOT EXISTS pending_registrations (
     email TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
     otp_code TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -75,6 +148,7 @@ CREATE TABLE IF NOT EXISTS projects (
     api_key_prefix TEXT NOT NULL,
     status TEXT DEFAULT 'Aktif',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TEXT,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
@@ -94,6 +168,8 @@ CREATE TABLE IF NOT EXISTS errors (
     first_seen TEXT,
     last_seen TEXT,
     timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    environment TEXT,
+    release TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
@@ -115,46 +191,132 @@ CREATE TABLE IF NOT EXISTS payment_notifications (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS payment_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    merchant_oid TEXT NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL,
+    plan TEXT NOT NULL,
+    amount_kurus INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    paid_at TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 `);
 
 // =====================================================
-// VERİTABANI MIGRATION
-// Eski veritabanlarında eksik sütunları tamamlar.
-// Mevcut kayıtları silmez.
+// EKSİK SÜTUNLARI TAMAMLAMA
 // =====================================================
 
-// USERS
 addColumnIfMissing('users', 'plan_type', "TEXT DEFAULT 'free'");
 addColumnIfMissing('users', 'monthly_error_count', 'INTEGER DEFAULT 0');
 addColumnIfMissing('users', 'error_limit', 'INTEGER DEFAULT 3000');
 addColumnIfMissing('users', 'role', "TEXT DEFAULT 'user'");
 addColumnIfMissing('users', 'trial_ends_at', 'TEXT');
+addColumnIfMissing('users', 'subscription_ends_at', 'TEXT');
 addColumnIfMissing('users', 'reset_code', 'TEXT');
 addColumnIfMissing('users', 'reset_code_expires', 'TEXT');
 addColumnIfMissing('users', 'usage_month', 'TEXT');
 addColumnIfMissing('users', 'token_version', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('users', 'created_at', 'TEXT');
 
-// PENDING REGISTRATIONS
 addColumnIfMissing('pending_registrations', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
 addColumnIfMissing('pending_registrations', 'updated_at', 'TEXT');
 
-// PROJECTS
+addColumnIfMissing('projects', 'user_id', 'INTEGER');
+addColumnIfMissing('projects', 'name', 'TEXT');
+addColumnIfMissing('projects', 'api_key_hash', 'TEXT');
+addColumnIfMissing('projects', 'api_key_prefix', 'TEXT');
+addColumnIfMissing('projects', 'status', "TEXT DEFAULT 'Aktif'");
+addColumnIfMissing('projects', 'created_at', 'TEXT');
 addColumnIfMissing('projects', 'revoked_at', 'TEXT');
 
-// ERRORS
+addColumnIfMissing('errors', 'project_id', 'INTEGER');
+addColumnIfMissing('errors', 'level', 'TEXT');
+addColumnIfMissing('errors', 'status', "TEXT DEFAULT 'Aktif'");
+addColumnIfMissing('errors', 'message', 'TEXT');
+addColumnIfMissing('errors', 'stack', 'TEXT');
+addColumnIfMissing('errors', 'url', 'TEXT');
+addColumnIfMissing('errors', 'ip', 'TEXT');
+addColumnIfMissing('errors', 'browser', 'TEXT');
+addColumnIfMissing('errors', 'fingerprint', 'TEXT');
+addColumnIfMissing('errors', 'count', 'INTEGER DEFAULT 1');
+addColumnIfMissing('errors', 'affected_users', 'INTEGER DEFAULT 0');
+addColumnIfMissing('errors', 'first_seen', 'TEXT');
+addColumnIfMissing('errors', 'last_seen', 'TEXT');
+addColumnIfMissing('errors', 'timestamp', 'TEXT');
 addColumnIfMissing('errors', 'environment', 'TEXT');
 addColumnIfMissing('errors', 'release', 'TEXT');
 
+addColumnIfMissing('error_clients', 'error_id', 'INTEGER');
+addColumnIfMissing('error_clients', 'client_uuid', 'TEXT');
+
+addColumnIfMissing('payment_notifications', 'user_id', 'INTEGER');
+addColumnIfMissing('payment_notifications', 'plan', 'TEXT');
+addColumnIfMissing('payment_notifications', 'amount', 'TEXT');
+addColumnIfMissing('payment_notifications', 'method', 'TEXT');
+addColumnIfMissing('payment_notifications', 'note', 'TEXT');
+addColumnIfMissing('payment_notifications', 'status', "TEXT DEFAULT 'Bekliyor'");
+addColumnIfMissing('payment_notifications', 'created_at', 'TEXT');
+
 // =====================================================
-// VERİTABANI İNDEKSLERİ
+// TARİH ALANLARI
+// =====================================================
+
+backfillDateColumn('users', 'created_at');
+backfillDateColumn('projects', 'created_at');
+backfillDateColumn('payment_notifications', 'created_at');
+backfillDateColumn('errors', 'first_seen');
+backfillDateColumn('errors', 'last_seen');
+backfillDateColumn('errors', 'timestamp');
+
+db.prepare(`
+    UPDATE errors
+    SET count = 1
+    WHERE count IS NULL OR count < 1
+`).run();
+
+db.prepare(`
+    UPDATE errors
+    SET affected_users = 0
+    WHERE affected_users IS NULL
+`).run();
+
+// =====================================================
+// İNDEKSLER
 // =====================================================
 
 db.exec(`
-CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id);
-CREATE INDEX IF NOT EXISTS idx_errors_project_last_seen ON errors(project_id, last_seen);
-CREATE INDEX IF NOT EXISTS idx_errors_fingerprint ON errors(project_id, fingerprint);
-CREATE INDEX IF NOT EXISTS idx_error_clients_client ON error_clients(client_uuid);
+CREATE INDEX IF NOT EXISTS idx_projects_user
+ON projects(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_errors_project_last_seen
+ON errors(project_id, last_seen);
+
+CREATE INDEX IF NOT EXISTS idx_errors_fingerprint
+ON errors(project_id, fingerprint);
+
+CREATE INDEX IF NOT EXISTS idx_error_clients_client
+ON error_clients(client_uuid);
+
+CREATE INDEX IF NOT EXISTS idx_users_email
+ON users(email);
+
+CREATE INDEX IF NOT EXISTS idx_projects_revoked
+ON projects(user_id, revoked_at);
+
+CREATE INDEX IF NOT EXISTS idx_errors_status
+ON errors(project_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_payment_orders_user
+ON payment_orders(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_payment_orders_status
+ON payment_orders(status);
 `);
+
+console.log('[DB] Veritabanı ve migration kontrolleri tamamlandı.');
 
 // =====================================================
 // GÜVENLİK VE MIDDLEWARE
@@ -177,7 +339,9 @@ app.use((req, res, next) => {
 
 app.use(cors({
     origin(origin, callback) {
-        const allowedOrigins = ['https://pulsetrace-pro.onrender.com'];
+        const allowedOrigins = [
+            'https://pulsetrace-pro.onrender.com'
+        ];
 
         if (!origin) return callback(null, true);
 
@@ -193,13 +357,23 @@ app.use(cors({
 
 app.use(express.json({ limit: '256kb' }));
 
+// PayTR callback form-urlencoded gönderir.
+app.use(express.urlencoded({
+    extended: false,
+    limit: '32kb'
+}));
+
 // =====================================================
 // RATE LIMIT
 // =====================================================
 
 const rateBuckets = new Map();
 
-function rateLimit({ windowMs = 60000, max = 30, keyFn = req => req.ip } = {}) {
+function rateLimit({
+    windowMs = 60000,
+    max = 30,
+    keyFn = req => req.ip
+} = {}) {
     return (req, res, next) => {
         const now = Date.now();
         const key = `${req.path}:${keyFn(req)}`;
@@ -207,14 +381,20 @@ function rateLimit({ windowMs = 60000, max = 30, keyFn = req => req.ip } = {}) {
         let item = rateBuckets.get(key);
 
         if (!item || item.resetAt <= now) {
-            item = { count: 0, resetAt: now + windowMs };
+            item = {
+                count: 0,
+                resetAt: now + windowMs
+            };
         }
 
         item.count += 1;
         rateBuckets.set(key, item);
 
         if (item.count > max) {
-            res.setHeader('Retry-After', Math.ceil((item.resetAt - now) / 1000));
+            res.setHeader(
+                'Retry-After',
+                Math.ceil((item.resetAt - now) / 1000)
+            );
 
             return res.status(429).json({
                 success: false,
@@ -241,19 +421,26 @@ setInterval(() => {
 // =====================================================
 
 function cleanEmail(value) {
-    return typeof value === 'string' ? value.trim().toLowerCase() : '';
+    return typeof value === 'string'
+        ? value.trim().toLowerCase()
+        : '';
 }
 
 function validEmail(email) {
-    return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    return email.length <= 254 &&
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 function safeString(value, max = 4000) {
-    return typeof value === 'string' ? value.trim().slice(0, max) : '';
+    return typeof value === 'string'
+        ? value.trim().slice(0, max)
+        : '';
 }
 
 function sha256(value) {
-    return crypto.createHash('sha256').update(value).digest('hex');
+    return crypto.createHash('sha256')
+        .update(value)
+        .digest('hex');
 }
 
 function otpHash(email, code, purpose) {
@@ -263,12 +450,15 @@ function otpHash(email, code, purpose) {
 }
 
 function safeEqual(a, b) {
-    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (typeof a !== 'string' || typeof b !== 'string') {
+        return false;
+    }
 
     const aa = Buffer.from(a);
     const bb = Buffer.from(b);
 
-    return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+    return aa.length === bb.length &&
+        crypto.timingSafeEqual(aa, bb);
 }
 
 function generateOtp() {
@@ -286,6 +476,47 @@ function sendError(res, status, message) {
     });
 }
 
+function getClientIp(req) {
+    let ip = req.ip || req.socket?.remoteAddress || '';
+
+    if (ip.startsWith('::ffff:')) {
+        ip = ip.substring(7);
+    }
+
+    if (ip === '::1') {
+        ip = '127.0.0.1';
+    }
+
+    return ip;
+}
+
+function createMerchantOid() {
+    return (
+        'PT' +
+        Date.now().toString(36).toUpperCase() +
+        crypto.randomBytes(8).toString('hex').toUpperCase()
+    );
+}
+
+function getPublicBaseUrl() {
+    const configured = process.env.PUBLIC_BASE_URL;
+
+    if (!configured) {
+        throw new Error('PUBLIC_BASE_URL ortam değişkeni eksik.');
+    }
+
+    const parsed = new URL(configured);
+
+    if (
+        IS_PRODUCTION &&
+        parsed.protocol !== 'https:'
+    ) {
+        throw new Error('Production ortamında PUBLIC_BASE_URL HTTPS olmalıdır.');
+    }
+
+    return parsed.origin;
+}
+
 // =====================================================
 // BREVO E-POSTA SİSTEMİ
 // =====================================================
@@ -294,40 +525,47 @@ async function sendMail({ to, subject, text }) {
     const apiKey = process.env.BREVO_API_KEY;
 
     if (!apiKey) {
-        throw new Error('Brevo API anahtarı eksik. Render Environment içine BREVO_API_KEY ekleyin.');
+        throw new Error('Brevo API anahtarı eksik.');
     }
 
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-        method: 'POST',
-        headers: {
-            'accept': 'application/json',
-            'api-key': apiKey,
-            'content-type': 'application/json'
-        },
-        body: JSON.stringify({
-            sender: {
-                email: process.env.MAIL_FROM_EMAIL || 'muhammetegelioglum@gmail.com',
-                name: 'PulseTrace Pro'
+    const response = await fetch(
+        'https://api.brevo.com/v3/smtp/email',
+        {
+            method: 'POST',
+            headers: {
+                accept: 'application/json',
+                'api-key': apiKey,
+                'content-type': 'application/json'
             },
-            to: [{ email: to }],
-            subject,
-            textContent: text
-        })
-    });
+            body: JSON.stringify({
+                sender: {
+                    email: process.env.MAIL_FROM_EMAIL ||
+                        'muhammetegelioglum@gmail.com',
+                    name: 'PulseTrace Pro'
+                },
+                to: [{ email: to }],
+                subject,
+                textContent: text
+            })
+        }
+    );
 
     const responseText = await response.text();
 
     let data = {};
 
     try {
-        data = responseText ? JSON.parse(responseText) : {};
+        data = responseText
+            ? JSON.parse(responseText)
+            : {};
     } catch {
         data = { message: responseText };
     }
 
     if (!response.ok) {
         throw new Error(
-            data.message || `Brevo e-posta gönderim hatası. HTTP ${response.status}`
+            data.message ||
+            `Brevo gönderim hatası. HTTP ${response.status}`
         );
     }
 
@@ -346,27 +584,68 @@ function verifyJwtSession(req, res, next) {
     }
 
     try {
-        const decoded = jwt.verify(authHeader.slice(7), SIGNING_SECRET);
+        const decoded = jwt.verify(
+            authHeader.slice(7),
+            SIGNING_SECRET,
+            { issuer: 'pulsetrace-pro' }
+        );
 
         const user = db.prepare(`
-            SELECT id, email, plan_type, monthly_error_count,
-                   error_limit, role, trial_ends_at, token_version
+            SELECT
+                id,
+                email,
+                plan_type,
+                monthly_error_count,
+                error_limit,
+                role,
+                trial_ends_at,
+                subscription_ends_at,
+                token_version
             FROM users
             WHERE id = ?
         `).get(decoded.userId);
 
         if (
             !user ||
-            Number(decoded.tokenVersion || 0) !== Number(user.token_version || 0)
+            Number(decoded.tokenVersion || 0) !==
+            Number(user.token_version || 0)
         ) {
-            return sendError(res, 401, 'Oturum geçersiz. Lütfen tekrar giriş yapın.');
+            return sendError(
+                res,
+                401,
+                'Oturum geçersiz. Lütfen tekrar giriş yapın.'
+            );
+        }
+
+        // Süresi dolmuş ücretli paketi Free seviyesine indir.
+        if (
+            user.plan_type !== 'free' &&
+            user.subscription_ends_at &&
+            Date.now() > Date.parse(user.subscription_ends_at)
+        ) {
+            db.prepare(`
+                UPDATE users
+                SET
+                    plan_type = 'free',
+                    error_limit = ?,
+                    subscription_ends_at = NULL
+                WHERE id = ?
+            `).run(PLANS.free.errorLimit, user.id);
+
+            user.plan_type = 'free';
+            user.error_limit = PLANS.free.errorLimit;
+            user.subscription_ends_at = null;
         }
 
         req.user = user;
         next();
 
     } catch {
-        return sendError(res, 401, 'Oturum süresi doldu veya geçersiz token.');
+        return sendError(
+            res,
+            401,
+            'Oturum süresi doldu veya geçersiz token.'
+        );
     }
 }
 
@@ -410,40 +689,66 @@ app.get('/api/health', (req, res) => {
             timestamp: new Date().toISOString()
         });
 
-    } catch {
+    } catch (err) {
+        console.error('Health check error:', err.message);
         sendError(res, 503, 'Veritabanı sağlık kontrolü başarısız.');
     }
 });
 
 // =====================================================
-// KULLANICI KAYIT
+// KAYIT
 // =====================================================
 
-app.post('/api/auth/register',
+app.post(
+    '/api/auth/register',
     rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }),
     async (req, res) => {
         const email = cleanEmail(req.body?.email);
+
         const password = typeof req.body?.password === 'string'
             ? req.body.password
             : '';
 
-        if (!validEmail(email) || password.length < 10 || password.length > 128) {
-            return sendError(res, 400, 'Geçerli e-posta girin. Şifre 10-128 karakter olmalıdır.');
+        if (
+            !validEmail(email) ||
+            password.length < 10 ||
+            password.length > 128
+        ) {
+            return sendError(
+                res,
+                400,
+                'Geçerli e-posta girin. Şifre 10-128 karakter olmalıdır.'
+            );
         }
 
-        if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
-            return sendError(res, 409, 'Bu e-posta adresi zaten kullanımda.');
+        if (
+            db.prepare('SELECT id FROM users WHERE email = ?').get(email)
+        ) {
+            return sendError(
+                res,
+                409,
+                'Bu e-posta adresi zaten kullanımda.'
+            );
         }
 
         const code = generateOtp();
-        const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+        const expiresAt = new Date(
+            Date.now() + 5 * 60 * 1000
+        ).toISOString();
 
         try {
             const passwordHash = await bcrypt.hash(password, 12);
 
             db.prepare(`
-                INSERT INTO pending_registrations
-                (email, password_hash, otp_code, expires_at, attempts, updated_at)
+                INSERT INTO pending_registrations (
+                    email,
+                    password_hash,
+                    otp_code,
+                    expires_at,
+                    attempts,
+                    updated_at
+                )
                 VALUES (?, ?, ?, ?, 0, ?)
                 ON CONFLICT(email) DO UPDATE SET
                     password_hash = excluded.password_hash,
@@ -473,49 +778,85 @@ app.post('/api/auth/register',
         } catch (err) {
             console.error('Register/mail error:', err.message);
 
-            db.prepare('DELETE FROM pending_registrations WHERE email = ?')
-                .run(email);
+            db.prepare(`
+                DELETE FROM pending_registrations
+                WHERE email = ?
+            `).run(email);
 
-            sendError(res, 503, 'E-posta gönderilemedi. Lütfen daha sonra tekrar deneyin.');
+            sendError(
+                res,
+                503,
+                'E-posta gönderilemedi. Lütfen daha sonra tekrar deneyin.'
+            );
         }
     }
 );
 
 // =====================================================
-// OTP DOĞRULAMA VE HESAP OLUŞTURMA
+// OTP DOĞRULAMA
 // =====================================================
 
-app.post('/api/auth/verify-otp',
+app.post(
+    '/api/auth/verify-otp',
     rateLimit({ max: 10, windowMs: 10 * 60 * 1000 }),
     (req, res) => {
         const email = cleanEmail(req.body?.email);
         const code = safeString(req.body?.code, 6);
 
         if (!validEmail(email) || !/^\d{6}$/.test(code)) {
-            return sendError(res, 400, 'E-posta ve 6 haneli kod gereklidir.');
+            return sendError(
+                res,
+                400,
+                'E-posta ve 6 haneli kod gereklidir.'
+            );
         }
 
         const pending = db.prepare(`
-            SELECT * FROM pending_registrations WHERE email = ?
+            SELECT *
+            FROM pending_registrations
+            WHERE email = ?
         `).get(email);
 
         if (!pending) {
-            return sendError(res, 400, 'Kayıt isteği bulunamadı veya süresi doldu.');
+            return sendError(
+                res,
+                400,
+                'Kayıt isteği bulunamadı veya süresi doldu.'
+            );
         }
 
         if (pending.attempts >= 5) {
-            db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
+            db.prepare(`
+                DELETE FROM pending_registrations
+                WHERE email = ?
+            `).run(email);
 
-            return sendError(res, 429, 'Çok fazla hatalı kod girildi. Yeniden kayıt isteği oluşturun.');
+            return sendError(
+                res,
+                429,
+                'Çok fazla hatalı kod girildi. Yeniden kayıt isteği oluşturun.'
+            );
         }
 
         if (Date.now() > Date.parse(pending.expires_at)) {
-            db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
+            db.prepare(`
+                DELETE FROM pending_registrations
+                WHERE email = ?
+            `).run(email);
 
-            return sendError(res, 400, 'Kodun süresi doldu. Yeniden kayıt olun.');
+            return sendError(
+                res,
+                400,
+                'Kodun süresi doldu. Yeniden kayıt olun.'
+            );
         }
 
-        if (!safeEqual(pending.otp_code, otpHash(email, code, 'register'))) {
+        if (
+            !safeEqual(
+                pending.otp_code,
+                otpHash(email, code, 'register')
+            )
+        ) {
             db.prepare(`
                 UPDATE pending_registrations
                 SET attempts = attempts + 1
@@ -565,7 +906,8 @@ app.post('/api/auth/verify-otp',
                 );
 
                 db.prepare(`
-                    DELETE FROM pending_registrations WHERE email = ?
+                    DELETE FROM pending_registrations
+                    WHERE email = ?
                 `).run(email);
 
                 return {
@@ -593,7 +935,11 @@ app.post('/api/auth/verify-otp',
         } catch (err) {
             console.error('OTP verification error:', err.message);
 
-            sendError(res, 500, 'Hesap oluşturulamadı. Veritabanı yapısını ve e-posta adresini kontrol edin.');
+            sendError(
+                res,
+                500,
+                'Hesap oluşturulamadı. Veritabanı yapısını ve e-posta adresini kontrol edin.'
+            );
         }
     }
 );
@@ -602,30 +948,51 @@ app.post('/api/auth/verify-otp',
 // GİRİŞ
 // =====================================================
 
-app.post('/api/auth/login',
+app.post(
+    '/api/auth/login',
     rateLimit({ max: 10, windowMs: 15 * 60 * 1000 }),
     async (req, res) => {
         const email = cleanEmail(req.body?.email);
+
         const password = typeof req.body?.password === 'string'
             ? req.body.password
             : '';
 
         if (!validEmail(email) || !password) {
-            return sendError(res, 400, 'E-posta ve şifre zorunludur.');
+            return sendError(
+                res,
+                400,
+                'E-posta ve şifre zorunludur.'
+            );
         }
 
         const user = db.prepare(`
-            SELECT * FROM users WHERE email = ?
+            SELECT *
+            FROM users
+            WHERE email = ?
         `).get(email);
 
-        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-            return sendError(res, 401, 'E-posta veya şifre hatalı.');
+        if (
+            !user ||
+            !(await bcrypt.compare(password, user.password_hash))
+        ) {
+            return sendError(
+                res,
+                401,
+                'E-posta veya şifre hatalı.'
+            );
         }
 
         resetMonthlyUsage(user.id);
 
         const freshUser = db.prepare(`
-            SELECT id, email, role, token_version, plan_type
+            SELECT
+                id,
+                email,
+                role,
+                token_version,
+                plan_type,
+                subscription_ends_at
             FROM users
             WHERE id = ?
         `).get(user.id);
@@ -636,16 +1003,18 @@ app.post('/api/auth/login',
             userId: freshUser.id,
             email: freshUser.email,
             role: freshUser.role,
-            plan: freshUser.plan_type
+            plan: freshUser.plan_type,
+            subscriptionEndsAt: freshUser.subscription_ends_at
         });
     }
 );
 
 // =====================================================
-// ŞİFRE SIFIRLAMA E-POSTASI
+// ŞİFRE SIFIRLAMA İSTEĞİ
 // =====================================================
 
-app.post('/api/auth/forgot-password',
+app.post(
+    '/api/auth/forgot-password',
     rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }),
     async (req, res) => {
         const email = cleanEmail(req.body?.email);
@@ -655,10 +1024,13 @@ app.post('/api/auth/forgot-password',
         }
 
         const user = db.prepare(`
-            SELECT id FROM users WHERE email = ?
+            SELECT id
+            FROM users
+            WHERE email = ?
         `).get(email);
 
-        const genericMessage = 'Eğer bu e-posta kayıtlıysa sıfırlama kodu gönderilmiştir.';
+        const genericMessage =
+            'Eğer bu e-posta kayıtlıysa sıfırlama kodu gönderilmiştir.';
 
         if (!user) {
             return res.json({
@@ -668,7 +1040,10 @@ app.post('/api/auth/forgot-password',
         }
 
         const code = generateOtp();
-        const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+        const expires = new Date(
+            Date.now() + 15 * 60 * 1000
+        ).toISOString();
 
         db.prepare(`
             UPDATE users
@@ -695,14 +1070,17 @@ app.post('/api/auth/forgot-password',
         } catch (err) {
             console.error('Reset mail error:', err.message);
 
-            // E-posta gönderilemezse geçersiz sıfırlama kodunu temizle.
             db.prepare(`
                 UPDATE users
                 SET reset_code = NULL, reset_code_expires = NULL
                 WHERE id = ?
             `).run(user.id);
 
-            sendError(res, 503, 'Şifre sıfırlama e-postası gönderilemedi. Lütfen daha sonra tekrar deneyin.');
+            sendError(
+                res,
+                503,
+                'Şifre sıfırlama e-postası gönderilemedi. Lütfen daha sonra tekrar deneyin.'
+            );
         }
     }
 );
@@ -711,15 +1089,17 @@ app.post('/api/auth/forgot-password',
 // YENİ ŞİFREYİ KAYDET
 // =====================================================
 
-app.post('/api/auth/reset-password',
+app.post(
+    '/api/auth/reset-password',
     rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }),
     async (req, res) => {
         const email = cleanEmail(req.body?.email);
         const code = safeString(req.body?.code, 6);
 
-        const newPassword = typeof req.body?.newPassword === 'string'
-            ? req.body.newPassword
-            : '';
+        const newPassword =
+            typeof req.body?.newPassword === 'string'
+                ? req.body.newPassword
+                : '';
 
         if (
             !validEmail(email) ||
@@ -727,7 +1107,11 @@ app.post('/api/auth/reset-password',
             newPassword.length < 10 ||
             newPassword.length > 128
         ) {
-            return sendError(res, 400, 'E-posta, 6 haneli kod ve en az 10 karakterlik yeni şifre gereklidir.');
+            return sendError(
+                res,
+                400,
+                'E-posta, 6 haneli kod ve en az 10 karakterlik yeni şifre gereklidir.'
+            );
         }
 
         const user = db.prepare(`
@@ -741,9 +1125,16 @@ app.post('/api/auth/reset-password',
             !user.reset_code ||
             !user.reset_code_expires ||
             Date.now() > Date.parse(user.reset_code_expires) ||
-            !safeEqual(user.reset_code, otpHash(email, code, 'reset'))
+            !safeEqual(
+                user.reset_code,
+                otpHash(email, code, 'reset')
+            )
         ) {
-            return sendError(res, 400, 'Kod geçersiz veya süresi dolmuş.');
+            return sendError(
+                res,
+                400,
+                'Kod geçersiz veya süresi dolmuş.'
+            );
         }
 
         try {
@@ -766,8 +1157,489 @@ app.post('/api/auth/reset-password',
 
         } catch (err) {
             console.error('Password reset error:', err.message);
-
             sendError(res, 500, 'Şifre güncellenemedi.');
+        }
+    }
+);
+
+// =====================================================
+// ÖDEME PAKETLERİNİ LİSTELE
+// =====================================================
+
+app.get('/api/payments/plans', (req, res) => {
+    res.json({
+        success: true,
+        currency: 'TRY',
+        plans: [
+            {
+                id: 'free',
+                name: 'Free',
+                price: 0,
+                period: 'Ücretsiz',
+                projectLimit: PLANS.free.projectLimit,
+                errorLimit: PLANS.free.errorLimit
+            },
+            {
+                id: 'starter',
+                name: 'Starter',
+                price: 79.90,
+                period: '30 gün',
+                projectLimit: PLANS.starter.projectLimit,
+                errorLimit: PLANS.starter.errorLimit
+            },
+            {
+                id: 'pro',
+                name: 'Pro',
+                price: 149.90,
+                period: '30 gün',
+                projectLimit: PLANS.pro.projectLimit,
+                errorLimit: PLANS.pro.errorLimit
+            }
+        ]
+    });
+});
+
+// =====================================================
+// PAYTR ÖDEME BAŞLAT
+// =====================================================
+
+app.post(
+    '/api/payments/create',
+    verifyJwtSession,
+    rateLimit({ max: 5, windowMs: 10 * 60 * 1000 }),
+    async (req, res) => {
+        try {
+            const planId = safeString(req.body?.plan, 20).toLowerCase();
+
+            if (!['starter', 'pro'].includes(planId)) {
+                return sendError(
+                    res,
+                    400,
+                    'Geçersiz paket seçimi.'
+                );
+            }
+
+            const plan = PLANS[planId];
+
+            const merchantId = process.env.PAYTR_MERCHANT_ID;
+            const merchantKey = process.env.PAYTR_MERCHANT_KEY;
+            const merchantSalt = process.env.PAYTR_MERCHANT_SALT;
+
+            if (!merchantId || !merchantKey || !merchantSalt) {
+                console.error('PayTR ortam değişkenleri eksik.');
+
+                return sendError(
+                    res,
+                    503,
+                    'Ödeme sistemi henüz yapılandırılmamış.'
+                );
+            }
+
+            const email = req.user.email;
+
+            if (!validEmail(email)) {
+                return sendError(
+                    res,
+                    400,
+                    'Hesap e-posta adresi geçersiz.'
+                );
+            }
+
+            const userIp = getClientIp(req);
+
+            if (!userIp) {
+                return sendError(
+                    res,
+                    400,
+                    'Kullanıcı IP adresi alınamadı.'
+                );
+            }
+
+            const merchantOid = createMerchantOid();
+            const paymentAmount = String(plan.amount);
+
+            const basket = [
+                [
+                    `PulseTrace Pro ${plan.name} - 30 Gun`,
+                    (plan.amount / 100).toFixed(2),
+                    1
+                ]
+            ];
+
+            const userBasket = Buffer
+                .from(JSON.stringify(basket))
+                .toString('base64');
+
+            const noInstallment = '1';
+            const maxInstallment = '0';
+            const currency = 'TL';
+
+            const testMode =
+                process.env.PAYTR_TEST_MODE === '1'
+                    ? '1'
+                    : '0';
+
+            const baseUrl = getPublicBaseUrl();
+
+            const successUrl = `${baseUrl}/?payment=success`;
+            const failUrl = `${baseUrl}/?payment=failed`;
+
+            const hashString =
+                merchantId +
+                userIp +
+                merchantOid +
+                email +
+                paymentAmount +
+                userBasket +
+                noInstallment +
+                maxInstallment +
+                currency +
+                testMode;
+
+            const paytrToken = crypto
+                .createHmac('sha256', merchantKey)
+                .update(hashString + merchantSalt)
+                .digest('base64');
+
+            const formData = new URLSearchParams();
+
+            formData.append('merchant_id', merchantId);
+            formData.append('user_ip', userIp);
+            formData.append('merchant_oid', merchantOid);
+            formData.append('email', email);
+            formData.append('payment_amount', paymentAmount);
+            formData.append('paytr_token', paytrToken);
+            formData.append('user_basket', userBasket);
+            formData.append('debug_on', testMode === '1' ? '1' : '0');
+            formData.append('no_installment', noInstallment);
+            formData.append('max_installment', maxInstallment);
+            formData.append('user_name', email);
+            formData.append('user_address', 'Türkiye');
+            formData.append('user_phone', '0000000000');
+            formData.append('merchant_ok_url', successUrl);
+            formData.append('merchant_fail_url', failUrl);
+            formData.append('timeout_limit', '30');
+            formData.append('currency', currency);
+            formData.append('test_mode', testMode);
+            formData.append('lang', 'tr');
+
+            // Önce bekleyen siparişi kaydet.
+            db.prepare(`
+                INSERT INTO payment_orders (
+                    merchant_oid,
+                    user_id,
+                    plan,
+                    amount_kurus,
+                    status
+                )
+                VALUES (?, ?, ?, ?, 'pending')
+            `).run(
+                merchantOid,
+                req.user.id,
+                planId,
+                plan.amount
+            );
+
+            const response = await fetch(
+                'https://www.paytr.com/odeme/api/get-token',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded'
+                    },
+                    body: formData.toString(),
+                    signal: AbortSignal.timeout(20000)
+                }
+            );
+
+            const responseText = await response.text();
+
+            let paytrResponse;
+
+            try {
+                paytrResponse = JSON.parse(responseText);
+            } catch {
+                throw new Error('PayTR geçersiz yanıt döndürdü.');
+            }
+
+            if (
+                !response.ok ||
+                paytrResponse.status !== 'success' ||
+                !paytrResponse.token
+            ) {
+                console.error(
+                    'PayTR token error:',
+                    paytrResponse.reason || responseText
+                );
+
+                db.prepare(`
+                    UPDATE payment_orders
+                    SET status = 'token_failed'
+                    WHERE merchant_oid = ?
+                    AND status = 'pending'
+                `).run(merchantOid);
+
+                return sendError(
+                    res,
+                    502,
+                    paytrResponse.reason ||
+                    'PayTR ödeme oturumu oluşturulamadı.'
+                );
+            }
+
+            res.json({
+                success: true,
+                merchantOid,
+                plan: planId,
+                amount: (plan.amount / 100).toFixed(2),
+                currency: 'TRY',
+                token: paytrResponse.token,
+                iframeUrl:
+                    `https://www.paytr.com/odeme/guvenli/${encodeURIComponent(paytrResponse.token)}`
+            });
+
+        } catch (err) {
+            console.error('Payment create error:', err.message);
+
+            sendError(
+                res,
+                500,
+                'Ödeme başlatılamadı. Lütfen tekrar deneyin.'
+            );
+        }
+    }
+);
+
+// =====================================================
+// PAYTR ÖDEME BİLDİRİMİ / CALLBACK
+// =====================================================
+
+app.post(
+    '/api/payments/paytr-callback',
+    rateLimit({ max: 120, windowMs: 60000 }),
+    (req, res) => {
+        try {
+            const merchantKey = process.env.PAYTR_MERCHANT_KEY;
+            const merchantSalt = process.env.PAYTR_MERCHANT_SALT;
+
+            if (!merchantKey || !merchantSalt) {
+                console.error('PayTR callback anahtarları eksik.');
+                return res.status(500).send('ERROR');
+            }
+
+            const merchantOid = safeString(
+                req.body?.merchant_oid,
+                100
+            );
+
+            const status = safeString(
+                req.body?.status,
+                20
+            );
+
+            const totalAmount = safeString(
+                req.body?.total_amount,
+                30
+            );
+
+            const receivedHash = safeString(
+                req.body?.hash,
+                200
+            );
+
+            if (
+                !merchantOid ||
+                !status ||
+                !totalAmount ||
+                !receivedHash
+            ) {
+                console.error('PayTR callback eksik alan içeriyor.');
+                return res.status(400).send('ERROR');
+            }
+
+            const hashString =
+                merchantOid +
+                merchantSalt +
+                status +
+                totalAmount;
+
+            const calculatedHash = crypto
+                .createHmac('sha256', merchantKey)
+                .update(hashString)
+                .digest('base64');
+
+            if (!safeEqual(calculatedHash, receivedHash)) {
+                console.error(
+                    'PayTR callback hash doğrulaması başarısız:',
+                    merchantOid
+                );
+
+                return res.status(400).send('ERROR');
+            }
+
+            const order = db.prepare(`
+                SELECT *
+                FROM payment_orders
+                WHERE merchant_oid = ?
+            `).get(merchantOid);
+
+            if (!order) {
+                console.error(
+                    'PayTR callback siparişi bulunamadı:',
+                    merchantOid
+                );
+
+                // İmza geçerli. PayTR'nin gereksiz tekrar göndermesini önle.
+                return res.status(200).send('OK');
+            }
+
+            // Daha önce işlenen bildirim tekrar gelirse yeniden üyelik ekleme.
+            if (order.status !== 'pending') {
+                return res.status(200).send('OK');
+            }
+
+            const receivedAmount = Number(totalAmount);
+
+            if (
+                !Number.isSafeInteger(receivedAmount) ||
+                receivedAmount !== Number(order.amount_kurus)
+            ) {
+                console.error(
+                    'PayTR tutar uyuşmazlığı:',
+                    merchantOid,
+                    'Beklenen:',
+                    order.amount_kurus,
+                    'Gelen:',
+                    totalAmount
+                );
+
+                db.prepare(`
+                    UPDATE payment_orders
+                    SET status = 'amount_mismatch'
+                    WHERE merchant_oid = ?
+                    AND status = 'pending'
+                `).run(merchantOid);
+
+                return res.status(200).send('OK');
+            }
+
+            if (status !== 'success') {
+                db.prepare(`
+                    UPDATE payment_orders
+                    SET status = 'failed'
+                    WHERE merchant_oid = ?
+                    AND status = 'pending'
+                `).run(merchantOid);
+
+                console.log(
+                    '[PAYTR] Ödeme başarısız:',
+                    merchantOid
+                );
+
+                return res.status(200).send('OK');
+            }
+
+            const plan = PLANS[order.plan];
+
+            if (!plan || !['starter', 'pro'].includes(order.plan)) {
+                console.error(
+                    'PayTR siparişinde geçersiz paket:',
+                    merchantOid
+                );
+
+                db.prepare(`
+                    UPDATE payment_orders
+                    SET status = 'invalid_plan'
+                    WHERE merchant_oid = ?
+                `).run(merchantOid);
+
+                return res.status(200).send('OK');
+            }
+
+            const now = new Date();
+
+            const subscription = db.prepare(`
+                SELECT subscription_ends_at
+                FROM users
+                WHERE id = ?
+            `).get(order.user_id);
+
+            if (!subscription) {
+                console.error(
+                    'Ödeme kullanıcısı bulunamadı:',
+                    merchantOid
+                );
+
+                db.prepare(`
+                    UPDATE payment_orders
+                    SET status = 'user_missing'
+                    WHERE merchant_oid = ?
+                `).run(merchantOid);
+
+                return res.status(200).send('OK');
+            }
+
+            const currentExpiry = subscription.subscription_ends_at
+                ? Date.parse(subscription.subscription_ends_at)
+                : 0;
+
+            const startTime =
+                Number.isFinite(currentExpiry) &&
+                currentExpiry > now.getTime()
+                    ? currentExpiry
+                    : now.getTime();
+
+            const newExpiry = new Date(
+                startTime + SUBSCRIPTION_DAYS * 24 * 60 * 60 * 1000
+            ).toISOString();
+
+            // Sipariş onayı ve üyelik yükseltme tek transaction içinde.
+            db.transaction(() => {
+                const updateOrder = db.prepare(`
+                    UPDATE payment_orders
+                    SET
+                        status = 'paid',
+                        paid_at = ?
+                    WHERE merchant_oid = ?
+                    AND status = 'pending'
+                `).run(
+                    now.toISOString(),
+                    merchantOid
+                );
+
+                // Aynı ödeme ikinci defa işlenmesin.
+                if (!updateOrder.changes) {
+                    return;
+                }
+
+                db.prepare(`
+                    UPDATE users
+                    SET
+                        plan_type = ?,
+                        error_limit = ?,
+                        subscription_ends_at = ?
+                    WHERE id = ?
+                `).run(
+                    order.plan,
+                    plan.errorLimit,
+                    newExpiry,
+                    order.user_id
+                );
+            })();
+
+            console.log(
+                `[PAYTR] Ödeme başarılı. Kullanıcı: ${order.user_id}, Paket: ${order.plan}, Bitiş: ${newExpiry}`
+            );
+
+            return res.status(200).send('OK');
+
+        } catch (err) {
+            console.error(
+                'PayTR callback error:',
+                err.message
+            );
+
+            return res.status(500).send('ERROR');
         }
     }
 );
@@ -776,50 +1648,88 @@ app.post('/api/auth/reset-password',
 // KULLANICI PAKET BİLGİLERİ
 // =====================================================
 
-app.get('/api/user/subscription', verifyJwtSession, (req, res) => {
-    resetMonthlyUsage(req.user.id);
+app.get(
+    '/api/user/subscription',
+    verifyJwtSession,
+    (req, res) => {
+        resetMonthlyUsage(req.user.id);
 
-    const user = db.prepare(`
-        SELECT
-            email,
-            plan_type,
-            monthly_error_count,
-            error_limit,
-            role,
-            trial_ends_at
-        FROM users
-        WHERE id = ?
-    `).get(req.user.id);
+        const user = db.prepare(`
+            SELECT
+                email,
+                plan_type,
+                monthly_error_count,
+                error_limit,
+                role,
+                trial_ends_at,
+                subscription_ends_at
+            FROM users
+            WHERE id = ?
+        `).get(req.user.id);
 
-    res.json({
-        ...user,
-        trialExpired: Boolean(
-            user.trial_ends_at &&
-            Date.now() > Date.parse(user.trial_ends_at)
-        )
-    });
-});
+        const subscriptionExpired = Boolean(
+            user.subscription_ends_at &&
+            Date.now() > Date.parse(user.subscription_ends_at)
+        );
+
+        res.json({
+            ...user,
+            subscriptionExpired,
+            trialExpired: Boolean(
+                user.trial_ends_at &&
+                Date.now() > Date.parse(user.trial_ends_at)
+            ),
+            plans: {
+                free: {
+                    price: 0,
+                    projectLimit: PLANS.free.projectLimit,
+                    errorLimit: PLANS.free.errorLimit
+                },
+                starter: {
+                    price: 79.90,
+                    projectLimit: PLANS.starter.projectLimit,
+                    errorLimit: PLANS.starter.errorLimit
+                },
+                pro: {
+                    price: 149.90,
+                    projectLimit: PLANS.pro.projectLimit,
+                    errorLimit: PLANS.pro.errorLimit
+                }
+            }
+        });
+    }
+);
 
 // =====================================================
-// PROJELER
+// PROJELERİ LİSTELE
 // =====================================================
 
 app.get('/api/projects', verifyJwtSession, (req, res) => {
-    const projects = db.prepare(`
-        SELECT
-            id,
-            name,
-            api_key_prefix AS apiKey,
-            status,
-            created_at
-        FROM projects
-        WHERE user_id = ?
-        AND revoked_at IS NULL
-        ORDER BY id DESC
-    `).all(req.user.id);
+    try {
+        const projects = db.prepare(`
+            SELECT
+                id,
+                name,
+                api_key_prefix AS apiKey,
+                status,
+                created_at
+            FROM projects
+            WHERE user_id = ?
+            AND revoked_at IS NULL
+            ORDER BY id DESC
+        `).all(req.user.id);
 
-    res.json(projects);
+        res.json(projects);
+
+    } catch (err) {
+        console.error('Project list error:', err.message);
+        sendError(res, 500, 'Projeler listelenemedi.');
+    }
 });
+
+// =====================================================
+// PROJE OLUŞTUR
+// =====================================================
 
 app.post('/api/projects', verifyJwtSession, (req, res) => {
     const name = safeString(req.body?.name, 80);
@@ -828,30 +1738,37 @@ app.post('/api/projects', verifyJwtSession, (req, res) => {
         return sendError(res, 400, 'Proje adı zorunludur.');
     }
 
-    const projectCount = db.prepare(`
-        SELECT COUNT(*) AS n
-        FROM projects
-        WHERE user_id = ?
-        AND revoked_at IS NULL
-    `).get(req.user.id).n;
-
-    const maxProjects = req.user.plan_type === 'free' ? 3 : 50;
-
-    if (projectCount >= maxProjects) {
-        return sendError(res, 403, `Paketiniz en fazla ${maxProjects} proje oluşturabilir.`);
-    }
-
-    const rawKey = createApiKey();
-
     try {
+        const projectCount = db.prepare(`
+            SELECT COUNT(*) AS n
+            FROM projects
+            WHERE user_id = ?
+            AND revoked_at IS NULL
+        `).get(req.user.id).n;
+
+        const plan = PLANS[req.user.plan_type] || PLANS.free;
+        const maxProjects = plan.projectLimit;
+
+        if (projectCount >= maxProjects) {
+            return sendError(
+                res,
+                403,
+                `Paketiniz en fazla ${maxProjects} proje oluşturabilir.`
+            );
+        }
+
+        const rawKey = createApiKey();
+
         const result = db.prepare(`
             INSERT INTO projects (
                 user_id,
                 name,
                 api_key_hash,
-                api_key_prefix
+                api_key_prefix,
+                status,
+                created_at
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'Aktif', CURRENT_TIMESTAMP)
         `).run(
             req.user.id,
             name,
@@ -865,85 +1782,125 @@ app.post('/api/projects', verifyJwtSession, (req, res) => {
                 id: Number(result.lastInsertRowid),
                 name,
                 apiKey: rawKey,
-                status: 'Aktif'
+                status: 'Aktif',
+                created_at: new Date().toISOString()
             },
             warning: 'Bu API anahtarı yalnızca şimdi gösterilir. Güvenli biçimde saklayın.'
         });
 
     } catch (err) {
         console.error('Project create error:', err.message);
-
         sendError(res, 500, 'Proje oluşturulamadı.');
     }
 });
 
-app.post('/api/projects/:id/rotate-key', verifyJwtSession, (req, res) => {
-    const projectId = Number(req.params.id);
+// =====================================================
+// API ANAHTARI YENİLE
+// =====================================================
 
-    const project = db.prepare(`
-        SELECT id
-        FROM projects
-        WHERE id = ?
-        AND user_id = ?
-        AND revoked_at IS NULL
-    `).get(projectId, req.user.id);
+app.post(
+    '/api/projects/:id/rotate-key',
+    verifyJwtSession,
+    (req, res) => {
+        const projectId = Number(req.params.id);
 
-    if (!project) {
-        return sendError(res, 404, 'Proje bulunamadı.');
+        if (!Number.isSafeInteger(projectId) || projectId <= 0) {
+            return sendError(res, 400, 'Geçersiz proje ID.');
+        }
+
+        try {
+            const project = db.prepare(`
+                SELECT id
+                FROM projects
+                WHERE id = ?
+                AND user_id = ?
+                AND revoked_at IS NULL
+            `).get(projectId, req.user.id);
+
+            if (!project) {
+                return sendError(res, 404, 'Proje bulunamadı.');
+            }
+
+            const rawKey = createApiKey();
+
+            db.prepare(`
+                UPDATE projects
+                SET api_key_hash = ?, api_key_prefix = ?
+                WHERE id = ?
+                AND user_id = ?
+            `).run(
+                sha256(rawKey),
+                `${rawKey.slice(0, 14)}...`,
+                projectId,
+                req.user.id
+            );
+
+            res.json({
+                success: true,
+                apiKey: rawKey,
+                message: 'Yeni anahtar oluşturuldu. Eski anahtar artık geçersiz.'
+            });
+
+        } catch (err) {
+            console.error('Project key rotation error:', err.message);
+            sendError(res, 500, 'API anahtarı yenilenemedi.');
+        }
     }
+);
 
-    const rawKey = createApiKey();
+// =====================================================
+// PROJE SİL / PASİFLEŞTİR
+// =====================================================
 
-    db.prepare(`
-        UPDATE projects
-        SET api_key_hash = ?, api_key_prefix = ?
-        WHERE id = ?
-    `).run(
-        sha256(rawKey),
-        `${rawKey.slice(0, 14)}...`,
-        projectId
-    );
+app.delete(
+    '/api/projects/:id',
+    verifyJwtSession,
+    (req, res) => {
+        const projectId = Number(req.params.id);
 
-    res.json({
-        success: true,
-        apiKey: rawKey,
-        message: 'Yeni anahtar oluşturuldu. Eski anahtar artık geçersiz.'
-    });
-});
+        if (!Number.isSafeInteger(projectId) || projectId <= 0) {
+            return sendError(res, 400, 'Geçersiz proje ID.');
+        }
 
-app.delete('/api/projects/:id', verifyJwtSession, (req, res) => {
-    const projectId = Number(req.params.id);
+        try {
+            const result = db.prepare(`
+                UPDATE projects
+                SET revoked_at = ?, status = ?
+                WHERE id = ?
+                AND user_id = ?
+                AND revoked_at IS NULL
+            `).run(
+                new Date().toISOString(),
+                'Pasif',
+                projectId,
+                req.user.id
+            );
 
-    const result = db.prepare(`
-        UPDATE projects
-        SET revoked_at = ?, status = ?
-        WHERE id = ?
-        AND user_id = ?
-        AND revoked_at IS NULL
-    `).run(
-        new Date().toISOString(),
-        'Pasif',
-        projectId,
-        req.user.id
-    );
+            if (!result.changes) {
+                return sendError(res, 404, 'Proje bulunamadı.');
+            }
 
-    if (!result.changes) {
-        return sendError(res, 404, 'Proje bulunamadı.');
+            res.json({ success: true });
+
+        } catch (err) {
+            console.error('Project delete error:', err.message);
+            sendError(res, 500, 'Proje silinemedi.');
+        }
     }
-
-    res.json({ success: true });
-});
+);
 
 // =====================================================
 // HARİCİ UYGULAMALARDAN HATA ALMA
 // =====================================================
 
-app.post('/api/errors',
+app.post(
+    '/api/errors',
     rateLimit({ max: 120, windowMs: 60000 }),
     (req, res) => {
         const rawKey = safeString(
             req.get('x-api-key') ||
-            (req.get('authorization') || '').replace(/^Bearer\s+/i, ''),
+            (req.get('authorization') || '')
+                .replace(/^Bearer\s+/i, ''),
             200
         );
 
@@ -951,85 +1908,142 @@ app.post('/api/errors',
             return sendError(res, 401, 'Proje API anahtarı gerekli.');
         }
 
-        const project = db.prepare(`
-            SELECT
-                p.id,
-                p.user_id,
-                p.status,
-                p.revoked_at,
-                u.error_limit,
-                u.monthly_error_count,
-                u.usage_month
-            FROM projects p
-            JOIN users u ON u.id = p.user_id
-            WHERE p.api_key_hash = ?
-        `).get(sha256(rawKey));
-
-        if (!project || project.revoked_at || project.status !== 'Aktif') {
-            return sendError(res, 401, 'API anahtarı geçersiz veya iptal edilmiş.');
-        }
-
-        resetMonthlyUsage(project.user_id);
-
-        const owner = db.prepare(`
-            SELECT monthly_error_count, error_limit
-            FROM users
-            WHERE id = ?
-        `).get(project.user_id);
-
-        if (owner.monthly_error_count >= owner.error_limit) {
-            return sendError(res, 429, 'Aylık hata raporu kotanız doldu.');
-        }
-
-        const message = safeString(req.body?.message, 4000);
-
-        if (!message) {
-            return sendError(res, 400, 'message alanı zorunludur.');
-        }
-
-        const stack = safeString(req.body?.stack || req.body?.stackTrace, 12000);
-        const url = safeString(req.body?.url, 2000);
-
-        const levelInput = safeString(
-            req.body?.level || 'error',
-            20
-        ).toLowerCase();
-
-        const level = ['fatal', 'critical', 'error', 'warning', 'info'].includes(levelInput)
-            ? (
-                ['fatal', 'critical'].includes(levelInput)
-                    ? 'Kritik'
-                    : levelInput === 'warning'
-                        ? 'Uyari'
-                        : 'Hata'
-            )
-            : 'Hata';
-
-        const environment = safeString(req.body?.environment || 'production', 40);
-        const release = safeString(req.body?.release, 100);
-
-        const clientUuid = safeString(
-            req.body?.userId ||
-            req.body?.user_id ||
-            req.body?.clientId ||
-            '',
-            128
-        );
-
-        const browser = safeString(
-            req.body?.browser || req.get('user-agent') || '',
-            500
-        );
-
-        const ip = safeString(req.ip || '', 64);
-
-        const fingerprint = sha256(
-            `${project.id}|${message}|${stack.split('\n')[0]}|${url}`
-        ).slice(0, 48);
-
-        const now = new Date().toISOString();
-
         try {
+            const project = db.prepare(`
+                SELECT
+                    p.id,
+                    p.user_id,
+                    p.status,
+                    p.revoked_at,
+                    u.error_limit,
+                    u.monthly_error_count,
+                    u.usage_month,
+                    u.plan_type,
+                    u.subscription_ends_at
+                FROM projects p
+                JOIN users u ON u.id = p.user_id
+                WHERE p.api_key_hash = ?
+            `).get(sha256(rawKey));
+
+            if (
+                !project ||
+                project.revoked_at ||
+                project.status !== 'Aktif'
+            ) {
+                return sendError(
+                    res,
+                    401,
+                    'API anahtarı geçersiz veya iptal edilmiş.'
+                );
+            }
+
+            // Süresi biten ücretli paketi API isteklerinde de Free yap.
+            if (
+                project.plan_type !== 'free' &&
+                project.subscription_ends_at &&
+                Date.now() > Date.parse(project.subscription_ends_at)
+            ) {
+                db.prepare(`
+                    UPDATE users
+                    SET
+                        plan_type = 'free',
+                        error_limit = ?,
+                        subscription_ends_at = NULL
+                    WHERE id = ?
+                `).run(
+                    PLANS.free.errorLimit,
+                    project.user_id
+                );
+            }
+
+            resetMonthlyUsage(project.user_id);
+
+            const owner = db.prepare(`
+                SELECT monthly_error_count, error_limit
+                FROM users
+                WHERE id = ?
+            `).get(project.user_id);
+
+            if (owner.monthly_error_count >= owner.error_limit) {
+                return sendError(
+                    res,
+                    429,
+                    'Aylık hata raporu kotanız doldu.'
+                );
+            }
+
+            const message = safeString(
+                req.body?.message,
+                4000
+            );
+
+            if (!message) {
+                return sendError(
+                    res,
+                    400,
+                    'message alanı zorunludur.'
+                );
+            }
+
+            const stack = safeString(
+                req.body?.stack || req.body?.stackTrace,
+                12000
+            );
+
+            const url = safeString(req.body?.url, 2000);
+
+            const levelInput = safeString(
+                req.body?.level || 'error',
+                20
+            ).toLowerCase();
+
+            const level = [
+                'fatal',
+                'critical',
+                'error',
+                'warning',
+                'info'
+            ].includes(levelInput)
+                ? (
+                    ['fatal', 'critical'].includes(levelInput)
+                        ? 'Kritik'
+                        : levelInput === 'warning'
+                            ? 'Uyari'
+                            : 'Hata'
+                )
+                : 'Hata';
+
+            const environment = safeString(
+                req.body?.environment || 'production',
+                40
+            );
+
+            const release = safeString(
+                req.body?.release,
+                100
+            );
+
+            const clientUuid = safeString(
+                req.body?.userId ||
+                req.body?.user_id ||
+                req.body?.clientId ||
+                '',
+                128
+            );
+
+            const browser = safeString(
+                req.body?.browser || req.get('user-agent') || '',
+                500
+            );
+
+            const ip = safeString(req.ip || '', 64);
+
+            const fingerprint = sha256(
+                `${project.id}|${message}|${stack.split('\n')[0]}|${url}`
+            ).slice(0, 48);
+
+            const now = new Date().toISOString();
+
             const result = db.transaction(() => {
                 const existing = db.prepare(`
                     SELECT id
@@ -1143,7 +2157,11 @@ app.post('/api/errors',
                     errorId,
                     grouped: Boolean(existing),
                     occurrenceCount: existing
-                        ? db.prepare('SELECT count FROM errors WHERE id = ?').get(errorId).count
+                        ? db.prepare(`
+                            SELECT count
+                            FROM errors
+                            WHERE id = ?
+                        `).get(errorId).count
                         : 1
                 };
             })();
@@ -1156,88 +2174,113 @@ app.post('/api/errors',
 
         } catch (err) {
             console.error('Error ingestion failed:', err.message);
-
             sendError(res, 500, 'Hata olayı kaydedilemedi.');
         }
     }
 );
 
 // =====================================================
-// HATALARI LİSTELEME
+// HATALARI LİSTELE
 // =====================================================
 
 app.get('/api/errors', verifyJwtSession, (req, res) => {
-    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    try {
+        const requestedLimit = Number.parseInt(
+            req.query.limit,
+            10
+        );
 
-    const limit = Number.isFinite(requestedLimit)
-        ? Math.min(Math.max(requestedLimit, 1), 500)
-        : 200;
+        const limit = Number.isFinite(requestedLimit)
+            ? Math.min(Math.max(requestedLimit, 1), 500)
+            : 200;
 
-    const beforeId = Number.parseInt(req.query.beforeId, 10);
+        const beforeId = Number.parseInt(
+            req.query.beforeId,
+            10
+        );
 
-    const projectId = req.query.projectId
-        ? Number.parseInt(req.query.projectId, 10)
-        : null;
+        const projectId = req.query.projectId
+            ? Number.parseInt(req.query.projectId, 10)
+            : null;
 
-    let sql = `
-        SELECT e.*, p.name AS project
-        FROM errors e
-        JOIN projects p ON p.id = e.project_id
-        WHERE p.user_id = ?
-        AND p.revoked_at IS NULL
-    `;
+        let sql = `
+            SELECT e.*, p.name AS project
+            FROM errors e
+            JOIN projects p ON p.id = e.project_id
+            WHERE p.user_id = ?
+            AND p.revoked_at IS NULL
+        `;
 
-    const params = [req.user.id];
+        const params = [req.user.id];
 
-    if (projectId !== null) {
-        if (!Number.isInteger(projectId)) {
-            return sendError(res, 400, 'Geçersiz proje ID.');
+        if (projectId !== null) {
+            if (!Number.isInteger(projectId)) {
+                return sendError(res, 400, 'Geçersiz proje ID.');
+            }
+
+            sql += ' AND e.project_id = ?';
+            params.push(projectId);
         }
 
-        sql += ' AND e.project_id = ?';
-        params.push(projectId);
+        if (Number.isInteger(beforeId)) {
+            sql += ' AND e.id < ?';
+            params.push(beforeId);
+        }
+
+        sql += ' ORDER BY e.id DESC LIMIT ?';
+        params.push(limit);
+
+        res.json(db.prepare(sql).all(...params));
+
+    } catch (err) {
+        console.error('Error list error:', err.message);
+        sendError(res, 500, 'Hatalar listelenemedi.');
     }
-
-    if (Number.isInteger(beforeId)) {
-        sql += ' AND e.id < ?';
-        params.push(beforeId);
-    }
-
-    sql += ' ORDER BY e.id DESC LIMIT ?';
-    params.push(limit);
-
-    res.json(db.prepare(sql).all(...params));
 });
 
 // =====================================================
 // HATA ÇÖZÜLDÜ OLARAK İŞARETLE
 // =====================================================
 
-app.patch('/api/errors/:id/resolve', verifyJwtSession, (req, res) => {
-    const id = Number.parseInt(req.params.id, 10);
+app.patch(
+    '/api/errors/:id/resolve',
+    verifyJwtSession,
+    (req, res) => {
+        const id = Number.parseInt(req.params.id, 10);
 
-    if (!Number.isInteger(id)) {
-        return sendError(res, 400, 'Geçersiz hata ID.');
+        if (!Number.isInteger(id)) {
+            return sendError(res, 400, 'Geçersiz hata ID.');
+        }
+
+        try {
+            const result = db.prepare(`
+                UPDATE errors
+                SET status = 'Çözüldü'
+                WHERE id = ?
+                AND project_id IN (
+                    SELECT id
+                    FROM projects
+                    WHERE user_id = ?
+                    AND revoked_at IS NULL
+                )
+            `).run(id, req.user.id);
+
+            if (!result.changes) {
+                return sendError(
+                    res,
+                    404,
+                    'Hata bulunamadı veya işlem yetkiniz yok.'
+                );
+            }
+
+            res.json({ success: true });
+
+        } catch (err) {
+            console.error('Resolve error:', err.message);
+            sendError(res, 500, 'Hata durumu güncellenemedi.');
+        }
     }
-
-    const result = db.prepare(`
-        UPDATE errors
-        SET status = 'Çözüldü'
-        WHERE id = ?
-        AND project_id IN (
-            SELECT id
-            FROM projects
-            WHERE user_id = ?
-            AND revoked_at IS NULL
-        )
-    `).run(id, req.user.id);
-
-    if (!result.changes) {
-        return sendError(res, 404, 'Hata bulunamadı veya işlem yetkiniz yok.');
-    }
-
-    res.json({ success: true });
-});
+);
 
 // =====================================================
 // ANA SAYFA
@@ -1252,13 +2295,18 @@ app.get('/', (req, res) => {
 // =====================================================
 
 app.use((err, req, res, next) => {
-    console.error('Unhandled request error:', err.message);
+    console.error(
+        'Unhandled request error:',
+        err.message
+    );
 
     if (res.headersSent) {
         return next(err);
     }
 
-    const status = err.type === 'entity.too.large' ? 413 : 500;
+    const status = err.type === 'entity.too.large'
+        ? 413
+        : 500;
 
     sendError(
         res,
@@ -1274,9 +2322,14 @@ app.use((err, req, res, next) => {
 // =====================================================
 
 const server = app.listen(PORT, () => {
-    console.log(`[PulseTrace Pro] Sunucu aktif: http://localhost:${PORT}`);
+    console.log(
+        `[PulseTrace Pro] Sunucu aktif: http://localhost:${PORT}`
+    );
+
     console.log(`[PulseTrace Pro] Veritabanı: ${DB_PATH}`);
-    console.log('[PulseTrace Pro] Veritabanı migration kontrolü tamamlandı.');
+
+    console.log('[PulseTrace Pro] Migration kontrolleri tamamlandı.');
+    console.log('[PulseTrace Pro] PayTR ödeme modülü hazır.');
 });
 
 // =====================================================
@@ -1289,9 +2342,16 @@ function shutdown() {
     server.close(() => {
         try {
             db.close();
-            console.log('[PulseTrace Pro] Veritabanı kapatıldı.');
+
+            console.log(
+                '[PulseTrace Pro] Veritabanı kapatıldı.'
+            );
+
         } catch (err) {
-            console.error('[PulseTrace Pro] Veritabanı kapatma hatası:', err.message);
+            console.error(
+                '[PulseTrace Pro] Veritabanı kapatma hatası:',
+                err.message
+            );
         }
 
         process.exit(0);
