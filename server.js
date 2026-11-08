@@ -9,7 +9,6 @@ const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -21,7 +20,7 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
         console.error('FATAL: Production ortamında en az 32 karakterlik JWT_SECRET zorunludur.');
         process.exit(1);
     }
-    console.warn('UYARI: JWT_SECRET ayarlanmamış veya kısa. Yerel test için geçici anahtar kullanılıyor. Canlıya çıkmadan önce .env içine güçlü JWT_SECRET ekleyin.');
+    console.warn('UYARI: JWT_SECRET ayarlanmamış veya kısa. Yerel test için geçici anahtar kullanılıyor.');
 }
 
 const SIGNING_SECRET = JWT_SECRET || crypto.randomBytes(48).toString('hex');
@@ -120,11 +119,6 @@ CREATE INDEX IF NOT EXISTS idx_errors_fingerprint ON errors(project_id, fingerpr
 CREATE INDEX IF NOT EXISTS idx_error_clients_client ON error_clients(client_uuid);
 `);
 
-const allowedOrigins = (process.env.CORS_ORIGINS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
 app.disable('x-powered-by');
 app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -137,18 +131,9 @@ app.use((req, res, next) => {
 
 app.use(cors({
     origin(origin, callback) {
-        const allowedOrigins = [
-            'https://pulsetrace-pro.onrender.com'
-        ];
-
-        // Sunucu tarafı isteklerine izin ver
+        const allowedOrigins = ['https://pulsetrace-pro.onrender.com'];
         if (!origin) return callback(null, true);
-
-        if (allowedOrigins.includes(origin.replace(/\/$/, ''))) {
-            return callback(null, true);
-        }
-
-        console.error('Engellenen CORS origin:', origin);
+        if (allowedOrigins.includes(origin.replace(/\/$/, ''))) return callback(null, true);
         return callback(new Error('CORS origin not allowed'));
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -209,22 +194,36 @@ function sendError(res, status, message) {
     return res.status(status).json({ success: false, message });
 }
 
-let transporter = null;
-if (process.env.BREVO_USER && process.env.BREVO_SMTP_KEY) {
-    transporter = nodemailer.createTransport({
-        host: process.env.BREVO_SMTP_HOST || 'smtp-relay.brevo.com',
-        port: Number(process.env.BREVO_SMTP_PORT || 587),
-        secure: false,
-        auth: { user: process.env.BREVO_USER, pass: process.env.BREVO_SMTP_KEY }
-    });
-}
-
+// Brevo HTTPS Transactional Email API Entegrasyonu (Port engeline takılmaz)
 async function sendMail({ to, subject, text }) {
-    if (!transporter) throw new Error('SMTP yapılandırması eksik. .env içinde BREVO_USER ve BREVO_SMTP_KEY ayarlanmalı.');
-    await transporter.sendMail({
-        from: process.env.MAIL_FROM || '"PulseTrace Pro" <noreply@pulsetrace.com>',
-        to, subject, text
+    const apiKey = process.env.BREVO_API_KEY;
+    if (!apiKey) {
+        throw new Error('Brevo API anahtarı eksik. Render Environment içine BREVO_API_KEY ekleyin.');
+    }
+
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+            'accept': 'application/json',
+            'api-key': apiKey,
+            'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+            sender: { 
+                email: process.env.MAIL_FROM_EMAIL || "noreply@pulsetrace.com", 
+                name: "PulseTrace Pro" 
+            },
+            to: [{ email: to }],
+            subject: subject,
+            textContent: text
+        })
     });
+
+    const data = await response.json();
+    if (!response.ok) {
+        throw new Error(data.message || 'Brevo API üzerinden e-posta gönderilemedi.');
+    }
+    return data;
 }
 
 function verifyJwtSession(req, res, next) {
@@ -271,7 +270,7 @@ app.get('/api/health', (req, res) => {
     }
 });
 
-// Kayıt ve e-posta OTP
+// Kayıt ve e-posta OTP (HTTPS API ile)
 app.post('/api/auth/register', rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }), async (req, res) => {
     const email = cleanEmail(req.body?.email);
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -306,7 +305,7 @@ app.post('/api/auth/register', rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }), 
     } catch (err) {
         console.error('Register/mail error:', err.message);
         db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
-        sendError(res, 503, 'E-posta gönderilemedi. SMTP ayarlarını kontrol edin.');
+        sendError(res, 503, err.message || 'E-posta gönderilemedi.');
     }
 });
 
@@ -391,7 +390,7 @@ app.post('/api/auth/forgot-password', rateLimit({ max: 5, windowMs: 15 * 60 * 10
         res.json({ success: true, message: genericMessage });
     } catch (err) {
         console.error('Reset mail error:', err.message);
-        sendError(res, 503, 'E-posta gönderilemedi. SMTP ayarlarını kontrol edin.');
+        sendError(res, 503, err.message || 'E-posta gönderilemedi.');
     }
 });
 
