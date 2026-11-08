@@ -1,4 +1,3 @@
-
 'use strict';
 
 require('dotenv').config();
@@ -26,8 +25,11 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 
 const SIGNING_SECRET = JWT_SECRET || crypto.randomBytes(48).toString('hex');
 
-const DB_PATH = path.join(__dirname, 'pulsetrace_enterprise.db');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'pulsetrace_enterprise.db');
 const db = new Database(DB_PATH);
+if (process.env.RENDER && !process.env.DB_PATH) {
+    console.warn('[DB] Render ortamında DB_PATH tanımlı değil. Kalıcı disk bağlanmadıysa SQLite verileri deploy/restart sonrası kaybolabilir.');
+}
 
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
@@ -137,7 +139,8 @@ CREATE TABLE IF NOT EXISTS pending_registrations (
     otp_code TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT
+    updated_at TEXT,
+    device_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -192,6 +195,15 @@ CREATE TABLE IF NOT EXISTS payment_notifications (
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS trial_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_hash TEXT NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL,
+    ip_hash TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS payment_orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     merchant_oid TEXT NOT NULL UNIQUE,
@@ -223,6 +235,7 @@ addColumnIfMissing('users', 'created_at', 'TEXT');
 
 addColumnIfMissing('pending_registrations', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
 addColumnIfMissing('pending_registrations', 'updated_at', 'TEXT');
+addColumnIfMissing('pending_registrations', 'device_hash', 'TEXT');
 
 addColumnIfMissing('projects', 'user_id', 'INTEGER');
 addColumnIfMissing('projects', 'name', 'TEXT');
@@ -259,6 +272,14 @@ addColumnIfMissing('payment_notifications', 'method', 'TEXT');
 addColumnIfMissing('payment_notifications', 'note', 'TEXT');
 addColumnIfMissing('payment_notifications', 'status', "TEXT DEFAULT 'Bekliyor'");
 addColumnIfMissing('payment_notifications', 'created_at', 'TEXT');
+
+addColumnIfMissing('payment_orders', 'merchant_oid', 'TEXT');
+addColumnIfMissing('payment_orders', 'user_id', 'INTEGER');
+addColumnIfMissing('payment_orders', 'plan', 'TEXT');
+addColumnIfMissing('payment_orders', 'amount_kurus', 'INTEGER');
+addColumnIfMissing('payment_orders', 'status', "TEXT DEFAULT 'pending'");
+addColumnIfMissing('payment_orders', 'created_at', 'TEXT');
+addColumnIfMissing('payment_orders', 'paid_at', 'TEXT');
 
 // =====================================================
 // TARİH ALANLARI
@@ -314,6 +335,9 @@ ON payment_orders(user_id);
 
 CREATE INDEX IF NOT EXISTS idx_payment_orders_status
 ON payment_orders(status);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trial_claims_device
+ON trial_claims(device_hash);
 `);
 
 console.log('[DB] Veritabanı ve migration kontrolleri tamamlandı.');
@@ -380,6 +404,14 @@ function rateLimit({
 
         let item = rateBuckets.get(key);
 
+        // In-memory limiter için bellek büyümesini sınırla. Çoklu instance için Redis gerekir.
+        if (!item && rateBuckets.size > 50000) {
+            for (const [bucketKey, bucket] of rateBuckets) {
+                if (bucket.resetAt <= now) rateBuckets.delete(bucketKey);
+                if (rateBuckets.size <= 40000) break;
+            }
+        }
+
         if (!item || item.resetAt <= now) {
             item = {
                 count: 0,
@@ -440,6 +472,12 @@ function safeString(value, max = 4000) {
 function sha256(value) {
     return crypto.createHash('sha256')
         .update(value)
+        .digest('hex');
+}
+
+function deviceHash(deviceId) {
+    return crypto.createHmac('sha256', SIGNING_SECRET)
+        .update(`trial-device:${deviceId}`)
         .digest('hex');
 }
 
@@ -576,77 +614,61 @@ async function sendMail({ to, subject, text }) {
 // JWT OTURUM SİSTEMİ
 // =====================================================
 
+function getSubscriptionState(user) {
+    const now = Date.now();
+    const plan = String(user?.plan_type || '').toLowerCase();
+    const expiryRaw = plan === 'free'
+        ? user?.trial_ends_at
+        : user?.subscription_ends_at;
+    const expiry = expiryRaw ? Date.parse(expiryRaw) : NaN;
+    const active = ['free', 'starter', 'pro'].includes(plan) &&
+        Number.isFinite(expiry) && expiry > now;
+    return {
+        active,
+        plan,
+        expiry: Number.isFinite(expiry) ? new Date(expiry).toISOString() : null,
+        expired: !active,
+        isTrial: plan === 'free'
+    };
+}
+
 function verifyJwtSession(req, res, next) {
     const authHeader = req.headers.authorization || '';
-
     if (!authHeader.startsWith('Bearer ')) {
         return sendError(res, 401, 'Oturum tokenı bulunamadı.');
     }
-
     try {
-        const decoded = jwt.verify(
-            authHeader.slice(7),
-            SIGNING_SECRET,
-            { issuer: 'pulsetrace-pro' }
-        );
-
+        const decoded = jwt.verify(authHeader.slice(7), SIGNING_SECRET, { issuer: 'pulsetrace-pro' });
         const user = db.prepare(`
-            SELECT
-                id,
-                email,
-                plan_type,
-                monthly_error_count,
-                error_limit,
-                role,
-                trial_ends_at,
-                subscription_ends_at,
-                token_version
-            FROM users
-            WHERE id = ?
+            SELECT id, email, plan_type, monthly_error_count, error_limit, role,
+                   trial_ends_at, subscription_ends_at, token_version
+            FROM users WHERE id = ?
         `).get(decoded.userId);
-
-        if (
-            !user ||
-            Number(decoded.tokenVersion || 0) !==
-            Number(user.token_version || 0)
-        ) {
-            return sendError(
-                res,
-                401,
-                'Oturum geçersiz. Lütfen tekrar giriş yapın.'
-            );
+        if (!user || Number(decoded.tokenVersion || 0) !== Number(user.token_version || 0)) {
+            return sendError(res, 401, 'Oturum geçersiz. Lütfen tekrar giriş yapın.');
         }
-
-        // Süresi dolmuş ücretli paketi Free seviyesine indir.
-        if (
-            user.plan_type !== 'free' &&
-            user.subscription_ends_at &&
-            Date.now() > Date.parse(user.subscription_ends_at)
-        ) {
-            db.prepare(`
-                UPDATE users
-                SET
-                    plan_type = 'free',
-                    error_limit = ?,
-                    subscription_ends_at = NULL
-                WHERE id = ?
-            `).run(PLANS.free.errorLimit, user.id);
-
-            user.plan_type = 'free';
-            user.error_limit = PLANS.free.errorLimit;
-            user.subscription_ends_at = null;
-        }
-
         req.user = user;
         next();
-
     } catch {
-        return sendError(
-            res,
-            401,
-            'Oturum süresi doldu veya geçersiz token.'
-        );
+        return sendError(res, 401, 'Oturum süresi doldu veya geçersiz token.');
     }
+}
+
+function requireActiveSubscription(req, res, next) {
+    const state = getSubscriptionState(req.user);
+    if (!state.active) {
+        return res.status(402).json({
+            success: false,
+            code: 'SUBSCRIPTION_REQUIRED',
+            message: state.isTrial
+                ? '7 günlük deneme süreniz sona erdi. Devam etmek için Starter veya Pro paketi satın alın.'
+                : 'Abonelik süreniz sona erdi. Devam etmek için paketinizi yenileyin.',
+            subscriptionExpired: true,
+            plan: state.plan,
+            expiresAt: state.expiry
+        });
+    }
+    next();
 }
 
 function issueToken(user) {
@@ -708,6 +730,11 @@ app.post(
         const password = typeof req.body?.password === 'string'
             ? req.body.password
             : '';
+        const deviceId = safeString(req.body?.deviceId, 100);
+        if (!/^[a-f0-9]{64}$/i.test(deviceId)) {
+            return sendError(res, 400, 'Cihaz doğrulama bilgisi geçersiz. Sayfayı yenileyip tekrar deneyin.');
+        }
+        const hashedDevice = deviceHash(deviceId);
 
         if (
             !validEmail(email) ||
@@ -747,21 +774,24 @@ app.post(
                     otp_code,
                     expires_at,
                     attempts,
-                    updated_at
+                    updated_at,
+                    device_hash
                 )
-                VALUES (?, ?, ?, ?, 0, ?)
+                VALUES (?, ?, ?, ?, 0, ?, ?)
                 ON CONFLICT(email) DO UPDATE SET
                     password_hash = excluded.password_hash,
                     otp_code = excluded.otp_code,
                     expires_at = excluded.expires_at,
                     attempts = 0,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    device_hash = excluded.device_hash
             `).run(
                 email,
                 passwordHash,
                 otpHash(email, code, 'register'),
                 expiresAt,
-                new Date().toISOString()
+                new Date().toISOString(),
+                hashedDevice
             );
 
             await sendMail({
@@ -868,6 +898,13 @@ app.post(
 
         try {
             const created = db.transaction(() => {
+                if (!pending.device_hash) {
+                    throw new Error('DEVICE_HASH_MISSING');
+                }
+                const claimed = db.prepare('SELECT user_id FROM trial_claims WHERE device_hash = ?').get(pending.device_hash);
+                if (claimed) {
+                    throw new Error('TRIAL_ALREADY_CLAIMED');
+                }
                 const result = db.prepare(`
                     INSERT INTO users (
                         email,
@@ -888,6 +925,8 @@ app.post(
                 );
 
                 const userId = Number(result.lastInsertRowid);
+                db.prepare(`INSERT INTO trial_claims (device_hash, user_id, ip_hash) VALUES (?, ?, ?)`)
+                    .run(pending.device_hash, userId, sha256(getClientIp(req) || 'unknown'));
                 const rawKey = createApiKey();
 
                 db.prepare(`
@@ -933,13 +972,12 @@ app.post(
             });
 
         } catch (err) {
+            if (err.message === 'TRIAL_ALREADY_CLAIMED') {
+                db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
+                return sendError(res, 409, 'Bu tarayıcı cihazında daha önce deneme hesabı oluşturulmuş. Mevcut hesabınıza giriş yapın. Cihaz verisi temizlenirse bu kontrol aşılabilir; kesin kişi doğrulaması için SMS sağlayıcısı gerekir.');
+            }
             console.error('OTP verification error:', err.message);
-
-            sendError(
-                res,
-                500,
-                'Hesap oluşturulamadı. Veritabanı yapısını ve e-posta adresini kontrol edin.'
-            );
+            sendError(res, 500, 'Hesap oluşturulamadı. Lütfen tekrar deneyin.');
         }
     }
 );
@@ -957,7 +995,6 @@ app.post(
         const password = typeof req.body?.password === 'string'
             ? req.body.password
             : '';
-
         if (!validEmail(email) || !password) {
             return sendError(
                 res,
@@ -1172,14 +1209,6 @@ app.get('/api/payments/plans', (req, res) => {
         currency: 'TRY',
         plans: [
             {
-                id: 'free',
-                name: 'Free',
-                price: 0,
-                period: 'Ücretsiz',
-                projectLimit: PLANS.free.projectLimit,
-                errorLimit: PLANS.free.errorLimit
-            },
-            {
                 id: 'starter',
                 name: 'Starter',
                 price: 79.90,
@@ -1208,6 +1237,7 @@ app.post(
     verifyJwtSession,
     rateLimit({ max: 5, windowMs: 10 * 60 * 1000 }),
     async (req, res) => {
+        let createdMerchantOid = null;
         try {
             const planId = safeString(req.body?.plan, 20).toLowerCase();
 
@@ -1236,12 +1266,20 @@ app.post(
             }
 
             const email = req.user.email;
+            const userName = safeString(req.body?.userName, 60);
+            const userAddress = safeString(req.body?.userAddress, 400);
+            const userPhone = safeString(req.body?.userPhone, 20);
 
-            if (!validEmail(email)) {
+            const normalizedPhone = userPhone.replace(/\D/g, '');
+            if (!userName || !userAddress || normalizedPhone.length < 10 || normalizedPhone.length > 15) {
+                return sendError(res, 400, 'Ödeme için ad soyad, adres ve 10-15 haneli telefon numarası gereklidir.');
+            }
+
+            if (!validEmail(email) || email.length > 100) {
                 return sendError(
                     res,
                     400,
-                    'Hesap e-posta adresi geçersiz.'
+                    'Hesap e-posta adresi PayTR için geçersiz.'
                 );
             }
 
@@ -1256,6 +1294,7 @@ app.post(
             }
 
             const merchantOid = createMerchantOid();
+            createdMerchantOid = merchantOid;
             const paymentAmount = String(plan.amount);
 
             const basket = [
@@ -1313,9 +1352,9 @@ app.post(
             formData.append('debug_on', testMode === '1' ? '1' : '0');
             formData.append('no_installment', noInstallment);
             formData.append('max_installment', maxInstallment);
-            formData.append('user_name', email);
-            formData.append('user_address', 'Türkiye');
-            formData.append('user_phone', '0000000000');
+            formData.append('user_name', userName);
+            formData.append('user_address', userAddress);
+            formData.append('user_phone', normalizedPhone);
             formData.append('merchant_ok_url', successUrl);
             formData.append('merchant_fail_url', failUrl);
             formData.append('timeout_limit', '30');
@@ -1400,7 +1439,9 @@ app.post(
 
         } catch (err) {
             console.error('Payment create error:', err.message);
-
+            if (createdMerchantOid) {
+                try { db.prepare(`UPDATE payment_orders SET status = 'token_failed' WHERE merchant_oid = ? AND status = 'pending'`).run(createdMerchantOid); } catch {}
+            }
             sendError(
                 res,
                 500,
@@ -1667,18 +1708,22 @@ app.get(
             WHERE id = ?
         `).get(req.user.id);
 
-        const subscriptionExpired = Boolean(
-            user.subscription_ends_at &&
-            Date.now() > Date.parse(user.subscription_ends_at)
-        );
+        const state = getSubscriptionState(user);
+        const remainingMs = state.expiry ? Math.max(0, Date.parse(state.expiry) - Date.now()) : 0;
+        const trialExpired = user.plan_type === 'free' && !state.active;
+        const subscriptionExpired = ['starter', 'pro'].includes(user.plan_type) && !state.active;
 
         res.json({
             ...user,
+            accessActive: state.active,
+            accessExpired: !state.active,
+            accessEndsAt: state.expiry,
+            daysRemaining: Math.ceil(remainingMs / 86400000),
             subscriptionExpired,
-            trialExpired: Boolean(
-                user.trial_ends_at &&
-                Date.now() > Date.parse(user.trial_ends_at)
-            ),
+            trialExpired,
+            subscriptionMessage: state.active
+                ? (state.isTrial ? '7 günlük deneme süreniz devam ediyor.' : 'Aboneliğiniz aktif.')
+                : (trialExpired ? 'Deneme süreniz sona erdi. Devam etmek için paket satın alın.' : 'Aboneliğiniz sona erdi. Yenileme yapmanız gerekiyor.'),
             plans: {
                 free: {
                     price: 0,
@@ -1704,7 +1749,7 @@ app.get(
 // PROJELERİ LİSTELE
 // =====================================================
 
-app.get('/api/projects', verifyJwtSession, (req, res) => {
+app.get('/api/projects', verifyJwtSession, requireActiveSubscription, (req, res) => {
     try {
         const projects = db.prepare(`
             SELECT
@@ -1731,64 +1776,35 @@ app.get('/api/projects', verifyJwtSession, (req, res) => {
 // PROJE OLUŞTUR
 // =====================================================
 
-app.post('/api/projects', verifyJwtSession, (req, res) => {
+app.post('/api/projects', verifyJwtSession, requireActiveSubscription, (req, res) => {
     const name = safeString(req.body?.name, 80);
-
-    if (!name) {
-        return sendError(res, 400, 'Proje adı zorunludur.');
-    }
-
+    if (!name) return sendError(res, 400, 'Proje adı zorunludur.');
     try {
-        const projectCount = db.prepare(`
-            SELECT COUNT(*) AS n
-            FROM projects
-            WHERE user_id = ?
-            AND revoked_at IS NULL
-        `).get(req.user.id).n;
-
-        const plan = PLANS[req.user.plan_type] || PLANS.free;
-        const maxProjects = plan.projectLimit;
-
-        if (projectCount >= maxProjects) {
-            return sendError(
-                res,
-                403,
-                `Paketiniz en fazla ${maxProjects} proje oluşturabilir.`
-            );
-        }
-
-        const rawKey = createApiKey();
-
-        const result = db.prepare(`
-            INSERT INTO projects (
-                user_id,
-                name,
-                api_key_hash,
-                api_key_prefix,
-                status,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, 'Aktif', CURRENT_TIMESTAMP)
-        `).run(
-            req.user.id,
-            name,
-            sha256(rawKey),
-            `${rawKey.slice(0, 14)}...`
-        );
-
+        const created = db.transaction(() => {
+            const projectCount = db.prepare(`
+                SELECT COUNT(*) AS n FROM projects
+                WHERE user_id = ? AND revoked_at IS NULL
+            `).get(req.user.id).n;
+            const plan = PLANS[req.user.plan_type];
+            if (!plan) throw new Error('INVALID_PLAN');
+            if (projectCount >= plan.projectLimit) throw new Error('PROJECT_LIMIT');
+            const rawKey = createApiKey();
+            const result = db.prepare(`
+                INSERT INTO projects (user_id, name, api_key_hash, api_key_prefix, status, created_at)
+                VALUES (?, ?, ?, ?, 'Aktif', CURRENT_TIMESTAMP)
+            `).run(req.user.id, name, sha256(rawKey), `${rawKey.slice(0, 14)}...`);
+            return { id: Number(result.lastInsertRowid), rawKey };
+        })();
         res.status(201).json({
             success: true,
-            project: {
-                id: Number(result.lastInsertRowid),
-                name,
-                apiKey: rawKey,
-                status: 'Aktif',
-                created_at: new Date().toISOString()
-            },
+            project: { id: created.id, name, apiKey: created.rawKey, status: 'Aktif', created_at: new Date().toISOString() },
             warning: 'Bu API anahtarı yalnızca şimdi gösterilir. Güvenli biçimde saklayın.'
         });
-
     } catch (err) {
+        if (err.message === 'PROJECT_LIMIT') {
+            const plan = PLANS[req.user.plan_type] || PLANS.free;
+            return sendError(res, 403, `Paketiniz en fazla ${plan.projectLimit} proje oluşturabilir.`);
+        }
         console.error('Project create error:', err.message);
         sendError(res, 500, 'Proje oluşturulamadı.');
     }
@@ -1801,6 +1817,7 @@ app.post('/api/projects', verifyJwtSession, (req, res) => {
 app.post(
     '/api/projects/:id/rotate-key',
     verifyJwtSession,
+    requireActiveSubscription,
     (req, res) => {
         const projectId = Number(req.params.id);
 
@@ -1855,6 +1872,7 @@ app.post(
 app.delete(
     '/api/projects/:id',
     verifyJwtSession,
+    requireActiveSubscription,
     (req, res) => {
         const projectId = Number(req.params.id);
 
@@ -1919,6 +1937,7 @@ app.post(
                     u.monthly_error_count,
                     u.usage_month,
                     u.plan_type,
+                    u.trial_ends_at,
                     u.subscription_ends_at
                 FROM projects p
                 JOIN users u ON u.id = p.user_id
@@ -1937,40 +1956,17 @@ app.post(
                 );
             }
 
-            // Süresi biten ücretli paketi API isteklerinde de Free yap.
-            if (
-                project.plan_type !== 'free' &&
-                project.subscription_ends_at &&
-                Date.now() > Date.parse(project.subscription_ends_at)
-            ) {
-                db.prepare(`
-                    UPDATE users
-                    SET
-                        plan_type = 'free',
-                        error_limit = ?,
-                        subscription_ends_at = NULL
-                    WHERE id = ?
-                `).run(
-                    PLANS.free.errorLimit,
-                    project.user_id
-                );
+            const entitlement = getSubscriptionState(project);
+            if (!entitlement.active) {
+                return res.status(402).json({
+                    success: false,
+                    code: 'SUBSCRIPTION_REQUIRED',
+                    message: 'Deneme veya abonelik süresi sona erdi. Hata gönderimi için paket satın alın.',
+                    subscriptionExpired: true
+                });
             }
 
             resetMonthlyUsage(project.user_id);
-
-            const owner = db.prepare(`
-                SELECT monthly_error_count, error_limit
-                FROM users
-                WHERE id = ?
-            `).get(project.user_id);
-
-            if (owner.monthly_error_count >= owner.error_limit) {
-                return sendError(
-                    res,
-                    429,
-                    'Aylık hata raporu kotanız doldu.'
-                );
-            }
 
             const message = safeString(
                 req.body?.message,
@@ -2045,6 +2041,13 @@ app.post(
             const now = new Date().toISOString();
 
             const result = db.transaction(() => {
+                const quotaUpdate = db.prepare(`
+                    UPDATE users
+                    SET monthly_error_count = monthly_error_count + 1
+                    WHERE id = ? AND monthly_error_count < error_limit
+                `).run(project.user_id);
+                if (!quotaUpdate.changes) throw new Error('QUOTA_EXCEEDED');
+
                 const existing = db.prepare(`
                     SELECT id
                     FROM errors
@@ -2147,12 +2150,6 @@ app.post(
                     WHERE id = ?
                 `).run(uniqueUsers, errorId);
 
-                db.prepare(`
-                    UPDATE users
-                    SET monthly_error_count = monthly_error_count + 1
-                    WHERE id = ?
-                `).run(project.user_id);
-
                 return {
                     errorId,
                     grouped: Boolean(existing),
@@ -2173,6 +2170,9 @@ app.post(
             });
 
         } catch (err) {
+            if (err.message === 'QUOTA_EXCEEDED') {
+                return sendError(res, 429, 'Aylık hata raporu kotanız doldu.');
+            }
             console.error('Error ingestion failed:', err.message);
             sendError(res, 500, 'Hata olayı kaydedilemedi.');
         }
@@ -2183,24 +2183,24 @@ app.post(
 // HATALARI LİSTELE
 // =====================================================
 
-app.get('/api/errors', verifyJwtSession, (req, res) => {
+app.get('/api/errors', verifyJwtSession, requireActiveSubscription, (req, res) => {
     try {
-        const requestedLimit = Number.parseInt(
-            req.query.limit,
-            10
-        );
+        const requestedLimit = req.query.limit === undefined ? 200 : Number(req.query.limit);
+        if (!Number.isInteger(requestedLimit) || requestedLimit < 1) {
+            return sendError(res, 400, 'limit pozitif bir tam sayı olmalıdır.');
+        }
 
         const limit = Number.isFinite(requestedLimit)
             ? Math.min(Math.max(requestedLimit, 1), 500)
             : 200;
 
-        const beforeId = Number.parseInt(
-            req.query.beforeId,
-            10
-        );
+        const beforeId = req.query.beforeId === undefined ? null : Number(req.query.beforeId);
+        if (beforeId !== null && (!Number.isSafeInteger(beforeId) || beforeId <= 0)) {
+            return sendError(res, 400, 'Geçersiz beforeId.');
+        }
 
         const projectId = req.query.projectId
-            ? Number.parseInt(req.query.projectId, 10)
+            ? Number(req.query.projectId)
             : null;
 
         let sql = `
@@ -2222,7 +2222,7 @@ app.get('/api/errors', verifyJwtSession, (req, res) => {
             params.push(projectId);
         }
 
-        if (Number.isInteger(beforeId)) {
+        if (beforeId !== null) {
             sql += ' AND e.id < ?';
             params.push(beforeId);
         }
@@ -2245,10 +2245,11 @@ app.get('/api/errors', verifyJwtSession, (req, res) => {
 app.patch(
     '/api/errors/:id/resolve',
     verifyJwtSession,
+    requireActiveSubscription,
     (req, res) => {
-        const id = Number.parseInt(req.params.id, 10);
+        const id = Number(req.params.id);
 
-        if (!Number.isInteger(id)) {
+        if (!Number.isSafeInteger(id) || id <= 0) {
             return sendError(res, 400, 'Geçersiz hata ID.');
         }
 
@@ -2306,14 +2307,16 @@ app.use((err, req, res, next) => {
 
     const status = err.type === 'entity.too.large'
         ? 413
-        : 500;
+        : (err.message === 'CORS origin not allowed' ? 403 : 500);
 
     sendError(
         res,
         status,
         status === 413
             ? 'İstek boyutu çok büyük.'
-            : 'Sunucu hatası.'
+            : status === 403
+                ? 'Bu kaynaktan gelen isteğe izin verilmiyor.'
+                : 'Sunucu hatası.'
     );
 });
 
