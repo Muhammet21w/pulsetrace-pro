@@ -210,7 +210,7 @@ async function sendMail({ to, subject, text }) {
         },
         body: JSON.stringify({
             sender: { 
-                email: process.env.MAIL_FROM_EMAIL || "noreply@pulsetrace.com", 
+                email: process.env.MAIL_FROM_EMAIL || "muhammetegelioglum@gmail.com", 
                 name: "PulseTrace Pro" 
             },
             to: [{ email: to }],
