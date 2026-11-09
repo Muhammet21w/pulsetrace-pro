@@ -619,7 +619,9 @@
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
                 <span style="font-family:var(--font-mono);font-size:14px;color:#fff;">📦 Aktif Abonelik Paketi:</span>
                 <span class="plan-badge" id="planBadgeText">FREE</span>
+                <button class="btn btn-warning" style="padding:4px 10px;font-size:11px;" onclick="openUpgradeModal()">⚡ Paket Yükselt</button>
             </div>
+            <div id="subscriptionNotice" style="display:none;font-size:12px;color:var(--warning);font-family:var(--font-mono);"></div>
             <div id="quotaText" style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono);">
                 Aylık Kullanım: 0 / 3.000
             </div>
@@ -745,6 +747,8 @@
             <label for="otpCodeVerify">Doğrulama Kodu</label>
             <input type="text" id="otpCodeVerify" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456">
             <button class="btn" id="verifyOtpButton" style="width:100%;" onclick="handleVerifyOtp()">Kodu Doğrula ve Kaydı Tamamla</button>
+            <button class="btn btn-secondary" id="resendOtpButton" style="width:100%;" onclick="handleResendOtp()">Kodu Tekrar Gönder</button>
+            <p style="color:var(--text-muted);font-size:11px;">E-posta gelmediyse spam/gereksiz klasörünü kontrol edin.</p>
             <button class="btn btn-secondary" style="width:100%;" onclick="switchAuthTab('register')">Geri Dön</button>
         </div>
 
@@ -752,7 +756,7 @@
             <p style="color:var(--text-muted);font-size:12px;">Kayıtlı e-posta adresinizi girin.</p>
             <label for="forgotEmail">E-posta</label>
             <input type="email" id="forgotEmail" autocomplete="email" placeholder="ornek@domain.com">
-            <button class="btn btn-warning" style="width:100%;" onclick="handleForgotPassword()">Sıfırlama Kodu Gönder</button>
+            <button class="btn btn-warning" id="forgotButton" style="width:100%;" onclick="handleForgotPassword()">Sıfırlama Kodu Gönder</button>
             <button class="btn btn-secondary" style="width:100%;" onclick="switchAuthTab('login')">Geri Dön</button>
         </div>
 
@@ -762,9 +766,37 @@
             <input type="text" id="resetCode" inputmode="numeric" maxlength="6" placeholder="123456">
             <label for="newPassword">Yeni Şifre (En az 10 karakter)</label>
             <input type="password" id="newPassword" autocomplete="new-password" minlength="10" placeholder="Yeni şifreniz">
-            <button class="btn" style="width:100%;" onclick="handleResetPassword()">Şifreyi Değiştir</button>
+            <button class="btn" id="resetButton" style="width:100%;" onclick="handleResetPassword()">Şifreyi Değiştir</button>
+            <button class="btn btn-secondary" style="width:100%;" onclick="switchAuthTab('forgot')">Kodu Tekrar İste</button>
+            <p style="color:var(--text-muted);font-size:11px;">E-posta gelmediyse spam/gereksiz klasörünü kontrol edin.</p>
             <button class="btn btn-secondary" style="width:100%;" onclick="switchAuthTab('login')">Giriş Ekranına Dön</button>
         </div>
+    </div>
+</div>
+
+<!-- UPGRADE / PAYMENT MODAL -->
+<div class="modal-overlay" id="upgradeModal">
+    <div class="modal-content" style="width:560px;">
+        <div class="modal-header">
+            <div class="modal-title">⚡ Paket Yükselt</div>
+            <button class="btn btn-secondary" style="padding:4px 9px;" onclick="closeUpgradeModal()">✕</button>
+        </div>
+        <div id="upgradeMessage" class="auth-message" role="alert"></div>
+        <div id="upgradeFormBox" class="modal-body">
+            <label for="upPlan">Paket</label>
+            <select id="upPlan">
+                <option value="starter">Starter - 79,90 TL / 30 gün (10 proje, 10.000 hata)</option>
+                <option value="pro">Pro - 149,90 TL / 30 gün (50 proje, 50.000 hata)</option>
+            </select>
+            <label for="upName">Ad Soyad</label>
+            <input type="text" id="upName" maxlength="60" autocomplete="name" placeholder="Ad Soyad">
+            <label for="upPhone">Telefon</label>
+            <input type="tel" id="upPhone" maxlength="20" autocomplete="tel" placeholder="05XXXXXXXXX">
+            <label for="upAddress">Adres</label>
+            <input type="text" id="upAddress" maxlength="400" autocomplete="street-address" placeholder="Fatura adresi">
+            <button class="btn" id="upPayButton" style="width:100%;margin-top:10px;" onclick="startPayment()">Ödemeye Geç</button>
+        </div>
+        <iframe id="paytrFrame" title="PayTR ödeme" style="display:none;width:100%;min-height:640px;border:0;background:#fff;border-radius:8px;"></iframe>
     </div>
 </div>
 
@@ -823,12 +855,19 @@ function clearAuthMessage() {
 }
 
 async function apiRequest(url, options = {}) {
-    const response = await fetch(url, {
-        ...options,
-        headers: {
-            ...(options.headers || {})
-        }
-    });
+    const sentAuth = Boolean(options.headers && options.headers.Authorization);
+
+    let response;
+    try {
+        response = await fetch(url, {
+            ...options,
+            headers: {
+                ...(options.headers || {})
+            }
+        });
+    } catch {
+        throw new Error('Sunucuya ulaşılamıyor. İnternet bağlantınızı kontrol edin.');
+    }
 
     let data = {};
 
@@ -838,9 +877,21 @@ async function apiRequest(url, options = {}) {
         data = { success: false, message: 'Sunucudan geçersiz yanıt alındı.' };
     }
 
-    if (response.status === 401 && authToken) {
+    // Yalnızca oturum gerektiren isteklerde 401 = oturum bitti.
+    // (Giriş ekranındaki "şifre hatalı" 401'i oturum kapatmamalı.)
+    if (response.status === 401 && sentAuth) {
         logoutUser(false);
+        document.getElementById('authModal').style.display = 'flex';
+        switchAuthTab('login');
+        showAuthMessage('Oturumunuz sona erdi. Lütfen yeniden giriş yapın.');
         throw new Error('Oturumunuz sona erdi. Lütfen yeniden giriş yapın.');
+    }
+
+    if (response.status === 402 && sentAuth) {
+        showSubscriptionExpired(data.message);
+        const err = new Error(data.message || 'Abonelik gerekli.');
+        err.subscriptionRequired = true;
+        throw err;
     }
 
     if (!response.ok) {
@@ -848,6 +899,22 @@ async function apiRequest(url, options = {}) {
     }
 
     return data;
+}
+
+// Cihaz kimliği: deneme hakkını kötüye kullanımdan korumak için sunucu 64 haneli hex ister.
+function getDeviceId() {
+    const key = 'pulsetrace_device_id';
+    let id = '';
+    try { id = localStorage.getItem(key) || ''; } catch { /* gizli mod */ }
+
+    if (!/^[a-f0-9]{64}$/i.test(id)) {
+        const bytes = new Uint8Array(32);
+        (window.crypto || window.msCrypto).getRandomValues(bytes);
+        id = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        try { localStorage.setItem(key, id); } catch { /* gizli mod */ }
+    }
+
+    return id;
 }
 
 function setButtonLoading(button, loading, originalText) {
@@ -913,7 +980,7 @@ function logoutUser(showModal = true) {
     }
 }
 
-function switchAuthTab(tab) {
+function switchAuthTab(tab, message, type) {
     const containers = [
         'loginFormContainer',
         'registerFormContainer',
@@ -942,6 +1009,7 @@ function switchAuthTab(tab) {
     }
 
     clearAuthMessage();
+    if (message) showAuthMessage(message, type || 'success');
 }
 
 async function handleLogin() {
@@ -999,11 +1067,11 @@ async function handleRegister() {
         const data = await apiRequest('/api/auth/register', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password })
+            body: JSON.stringify({ email, password, deviceId: getDeviceId() })
         });
 
-        showAuthMessage(data.message || 'Doğrulama kodu gönderildi.', 'success');
-        switchAuthTab('otp');
+        switchAuthTab('otp', data.message || 'Doğrulama kodu gönderildi.', 'success');
+        startResendCooldown('resendOtpButton', 'Kodu Tekrar Gönder');
     } catch (error) {
         showAuthMessage(error.message);
     } finally {
@@ -1036,6 +1104,10 @@ async function handleVerifyOtp() {
 
         saveSession(data);
 
+        if (data.trialGranted === false) {
+            alert(data.message);
+        }
+
         if (data.rawApiKey) {
             alert(
                 `Hesabınız başarıyla oluşturuldu.\n\n` +
@@ -1055,7 +1127,54 @@ async function handleVerifyOtp() {
     }
 }
 
+async function handleResendOtp() {
+    if (!registeredEmailTemp) {
+        showAuthMessage('Önce kayıt formunu doldurun.');
+        return switchAuthTab('register');
+    }
+
+    const button = document.getElementById('resendOtpButton');
+    setButtonLoading(button, true, 'Kodu Tekrar Gönder');
+
+    try {
+        const data = await apiRequest('/api/auth/resend-otp', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: registeredEmailTemp })
+        });
+
+        showAuthMessage(data.message || 'Yeni kod gönderildi.', 'success');
+        startResendCooldown('resendOtpButton', 'Kodu Tekrar Gönder');
+    } catch (error) {
+        showAuthMessage(error.message);
+        setButtonLoading(button, false, 'Kodu Tekrar Gönder');
+    }
+}
+
+function startResendCooldown(buttonId, label, seconds = 60) {
+    const button = document.getElementById(buttonId);
+    if (!button) return;
+
+    let left = seconds;
+    button.disabled = true;
+
+    const timer = setInterval(() => {
+        left -= 1;
+        if (left <= 0) {
+            clearInterval(timer);
+            button.disabled = false;
+            button.textContent = label;
+        } else {
+            button.textContent = `${label} (${left} sn)`;
+        }
+    }, 1000);
+
+    button.textContent = `${label} (${left} sn)`;
+}
+
 async function handleForgotPassword() {
+    const button = document.getElementById('forgotButton');
+    const originalText = 'Sıfırlama Kodu Gönder';
     const email = document.getElementById('forgotEmail').value.trim();
 
     if (!email) {
@@ -1064,6 +1183,7 @@ async function handleForgotPassword() {
     }
 
     resetEmailTarget = email;
+    setButtonLoading(button, true, originalText);
 
     try {
         const data = await apiRequest('/api/auth/forgot-password', {
@@ -1072,10 +1192,11 @@ async function handleForgotPassword() {
             body: JSON.stringify({ email })
         });
 
-        showAuthMessage(data.message || 'İşlem tamamlandı.', 'success');
-        switchAuthTab('reset');
+        switchAuthTab('reset', data.message || 'İşlem tamamlandı.', 'success');
     } catch (error) {
         showAuthMessage(error.message);
+    } finally {
+        setButtonLoading(button, false, originalText);
     }
 }
 
@@ -1093,6 +1214,9 @@ async function handleResetPassword() {
         return;
     }
 
+    const resetBtn = document.getElementById('resetButton');
+    setButtonLoading(resetBtn, true, 'Şifreyi Değiştir');
+
     try {
         const data = await apiRequest('/api/auth/reset-password', {
             method: 'POST',
@@ -1104,11 +1228,12 @@ async function handleResetPassword() {
             })
         });
 
-        alert(data.message || 'Şifreniz güncellendi.');
         logoutUser(true);
-        switchAuthTab('login');
+        switchAuthTab('login', data.message || 'Şifreniz güncellendi. Yeni şifrenizle giriş yapın.', 'success');
     } catch (error) {
         showAuthMessage(error.message);
+    } finally {
+        setButtonLoading(resetBtn, false, 'Şifreyi Değiştir');
     }
 }
 
@@ -1119,11 +1244,17 @@ async function init() {
     isRefreshing = true;
 
     try {
-        await Promise.all([
+        const results = await Promise.allSettled([
             loadSubscriptionInfo(),
             loadProjects(),
             loadErrors()
         ]);
+
+        results.forEach(result => {
+            if (result.status === 'rejected' && !result.reason?.subscriptionRequired) {
+                console.error('Panel yükleme hatası:', result.reason);
+            }
+        });
 
         if (refreshTimer) clearInterval(refreshTimer);
 
@@ -1155,7 +1286,97 @@ async function loadSubscriptionInfo() {
 
     document.getElementById('quotaBarFill').style.width = `${percent}%`;
     document.getElementById('quotaPercentText').textContent = `%${percent} Kullanıldı`;
+
+    const notice = document.getElementById('subscriptionNotice');
+    if (data.accessActive === false) {
+        showSubscriptionExpired(data.subscriptionMessage);
+    } else {
+        notice.style.display = 'block';
+        notice.textContent = `${data.subscriptionMessage || ''} Kalan gün: ${data.daysRemaining ?? '-'}`;
+    }
 }
+
+function showSubscriptionExpired(message) {
+    const notice = document.getElementById('subscriptionNotice');
+    if (notice) {
+        notice.style.display = 'block';
+        notice.textContent = message || 'Erişim süreniz doldu. Devam etmek için paket satın alın.';
+    }
+    openUpgradeModal(message);
+}
+
+function openUpgradeModal(message) {
+    const box = document.getElementById('upgradeMessage');
+    box.textContent = typeof message === 'string' ? message : '';
+    box.className = `auth-message ${typeof message === 'string' && message ? 'error' : ''}`;
+    document.getElementById('upgradeFormBox').style.display = 'flex';
+    document.getElementById('paytrFrame').style.display = 'none';
+    document.getElementById('paytrFrame').src = 'about:blank';
+    document.getElementById('upgradeModal').style.display = 'flex';
+}
+
+function closeUpgradeModal() {
+    document.getElementById('upgradeModal').style.display = 'none';
+    document.getElementById('paytrFrame').src = 'about:blank';
+}
+
+async function startPayment() {
+    const button = document.getElementById('upPayButton');
+    const box = document.getElementById('upgradeMessage');
+
+    const payload = {
+        plan: document.getElementById('upPlan').value,
+        userName: document.getElementById('upName').value.trim(),
+        userPhone: document.getElementById('upPhone').value.trim(),
+        userAddress: document.getElementById('upAddress').value.trim()
+    };
+
+    if (!payload.userName || !payload.userAddress || payload.userPhone.replace(/\D/g, '').length < 10) {
+        box.textContent = 'Ad soyad, adres ve en az 10 haneli telefon zorunludur.';
+        box.className = 'auth-message error';
+        return;
+    }
+
+    setButtonLoading(button, true, 'Ödemeye Geç');
+
+    try {
+        const data = await apiRequest('/api/payments/create', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify(payload)
+        });
+
+        box.className = 'auth-message';
+        box.textContent = '';
+        document.getElementById('upgradeFormBox').style.display = 'none';
+
+        const frame = document.getElementById('paytrFrame');
+        frame.src = data.iframeUrl;
+        frame.style.display = 'block';
+    } catch (error) {
+        box.textContent = error.message;
+        box.className = 'auth-message error';
+    } finally {
+        setButtonLoading(button, false, 'Ödemeye Geç');
+    }
+}
+
+// Ödeme sonrası yönlendirme (?payment=success|failed)
+(function handlePaymentReturn() {
+    const status = new URLSearchParams(location.search).get('payment');
+    if (!status) return;
+
+    history.replaceState(null, '', location.pathname);
+
+    setTimeout(() => {
+        alert(status === 'success'
+            ? 'Ödemeniz alındı. Paketiniz birkaç saniye içinde aktif olur; panel yenileniyor.'
+            : 'Ödeme tamamlanamadı. Tekrar deneyebilirsiniz.');
+        if (status === 'success' && authToken) {
+            setTimeout(() => init(), 4000);
+        }
+    }, 300);
+})();
 
 async function loadProjects() {
     const projects = await apiRequest('/api/projects', {
@@ -1544,6 +1765,7 @@ document.getElementById('errorModal').addEventListener('click', event => {
 document.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
         closeModal();
+        closeUpgradeModal();
     }
 });
 
@@ -1559,6 +1781,9 @@ document.getElementById('otpCodeVerify').addEventListener('keydown', event => {
     if (event.key === 'Enter') handleVerifyOtp();
 });
 
+document.getElementById('forgotEmail').addEventListener('keydown', event => {
+    if (event.key === 'Enter') handleForgotPassword();
+});
 document.getElementById('newPassword').addEventListener('keydown', event => {
     if (event.key === 'Enter') handleResetPassword();
 });

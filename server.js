@@ -10,6 +10,11 @@ const Database = require('better-sqlite3');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
+if (typeof fetch !== 'function') {
+    console.error('FATAL: Node.js 18 veya üstü gerekli (fetch desteği yok).');
+    process.exit(1);
+}
+
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
@@ -128,6 +133,8 @@ CREATE TABLE IF NOT EXISTS users (
     subscription_ends_at TEXT,
     reset_code TEXT,
     reset_code_expires TEXT,
+    reset_attempts INTEGER NOT NULL DEFAULT 0,
+    reset_requested_at TEXT,
     usage_month TEXT,
     token_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -229,6 +236,8 @@ addColumnIfMissing('users', 'trial_ends_at', 'TEXT');
 addColumnIfMissing('users', 'subscription_ends_at', 'TEXT');
 addColumnIfMissing('users', 'reset_code', 'TEXT');
 addColumnIfMissing('users', 'reset_code_expires', 'TEXT');
+addColumnIfMissing('users', 'reset_attempts', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('users', 'reset_requested_at', 'TEXT');
 addColumnIfMissing('users', 'usage_month', 'TEXT');
 addColumnIfMissing('users', 'token_version', 'INTEGER NOT NULL DEFAULT 0');
 addColumnIfMissing('users', 'created_at', 'TEXT');
@@ -361,22 +370,43 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(cors({
-    origin(origin, callback) {
-        const allowedOrigins = [
-            'https://pulsetrace-pro.onrender.com'
-        ];
+function buildAllowedOrigins() {
+    const list = new Set();
+    const add = value => {
+        if (!value) return;
+        try { list.add(new URL(value.trim()).origin); } catch { /* yoksay */ }
+    };
+    add(process.env.PUBLIC_BASE_URL);
+    add(process.env.RENDER_EXTERNAL_URL);
+    (process.env.CORS_ORIGINS || '').split(',').forEach(add);
+    return list;
+}
 
-        if (!origin) return callback(null, true);
+const ALLOWED_ORIGINS = buildAllowedOrigins();
 
-        if (allowedOrigins.includes(origin.replace(/\/$/, ''))) {
-            return callback(null, true);
-        }
+app.use(cors((req, callback) => {
+    const origin = req.headers.origin;
+    const base = {
+        methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+    };
 
-        return callback(new Error('CORS origin not allowed'));
-    },
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+    // Origin yoksa (curl, sunucudan sunucuya) serbest.
+    if (!origin) return callback(null, { ...base, origin: true });
+
+    let parsed;
+    try { parsed = new URL(origin); } catch { return callback(null, { ...base, origin: false }); }
+
+    const sameOrigin = parsed.host === req.headers.host;
+    const isLocalDev = !IS_PRODUCTION &&
+        ['localhost', '127.0.0.1'].includes(parsed.hostname);
+
+    if (sameOrigin || isLocalDev || ALLOWED_ORIGINS.has(parsed.origin)) {
+        return callback(null, { ...base, origin: true });
+    }
+
+    // Hata fırlatmak yerine CORS başlığı vermeyiz; tarayıcı engeller.
+    return callback(null, { ...base, origin: false });
 }));
 
 app.use(express.json({ limit: '256kb' }));
@@ -558,55 +588,162 @@ function getPublicBaseUrl() {
 // BREVO E-POSTA SİSTEMİ
 // =====================================================
 
-async function sendMail({ to, subject, text }) {
+const FREE_MAIL_DOMAINS = [
+    'gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com',
+    'hotmail.com', 'icloud.com', 'yandex.com', 'proton.me'
+];
+
+function getMailSender() {
+    const email = (process.env.MAIL_FROM_EMAIL || '').trim();
+    return {
+        email,
+        name: process.env.MAIL_FROM_NAME || 'PulseTrace Pro'
+    };
+}
+
+function escapeHtmlServer(value) {
+    return String(value).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+    })[c]);
+}
+
+function buildCodeEmail(title, intro, code, footer) {
+    return `<!doctype html><html><body style="margin:0;padding:24px;background:#f4f6f8;font-family:Arial,Helvetica,sans-serif;">
+<div style="max-width:480px;margin:auto;background:#ffffff;border-radius:10px;padding:28px;border:1px solid #e3e7eb;">
+<h2 style="margin:0 0 12px;color:#111;">${escapeHtmlServer(title)}</h2>
+<p style="color:#444;font-size:14px;line-height:1.5;">${escapeHtmlServer(intro)}</p>
+<div style="font-size:32px;letter-spacing:8px;font-weight:bold;text-align:center;background:#f0fff6;border:1px dashed #00b04f;border-radius:8px;padding:16px;margin:20px 0;color:#006b30;">${escapeHtmlServer(code)}</div>
+<p style="color:#777;font-size:12px;line-height:1.5;">${escapeHtmlServer(footer)}</p>
+</div></body></html>`;
+}
+
+async function sendMail({ to, subject, text, html }) {
     const apiKey = process.env.BREVO_API_KEY;
 
-    if (!apiKey) {
-        throw new Error('Brevo API anahtarı eksik.');
+    // Geliştirme ortamında anahtar yoksa kodu konsola yaz, akış test edilebilsin.
+    if (!apiKey && !IS_PRODUCTION) {
+        console.warn(`[MAIL-DEV] BREVO_API_KEY yok. E-posta gönderilmedi.\n  Alıcı: ${to}\n  Konu: ${subject}\n  İçerik: ${text}`);
+        return { dev: true };
     }
 
-    const response = await fetch(
-        'https://api.brevo.com/v3/smtp/email',
-        {
-            method: 'POST',
-            headers: {
-                accept: 'application/json',
-                'api-key': apiKey,
-                'content-type': 'application/json'
-            },
-            body: JSON.stringify({
-                sender: {
-                    email: process.env.MAIL_FROM_EMAIL ||
-                        'muhammetegelioglum@gmail.com',
-                    name: 'PulseTrace Pro'
+    if (!apiKey) {
+        throw new Error('BREVO_API_KEY tanımlı değil.');
+    }
+
+    const sender = getMailSender();
+
+    if (!sender.email) {
+        throw new Error('MAIL_FROM_EMAIL tanımlı değil. Brevo\'da doğrulanmış bir gönderen adresi girin.');
+    }
+
+    const payload = {
+        sender: { email: sender.email, name: sender.name },
+        to: [{ email: to }],
+        subject,
+        textContent: text
+    };
+
+    if (html) payload.htmlContent = html;
+
+    let lastError;
+
+    // Geçici ağ/5xx hatalarında 2 kez daha dene.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+                method: 'POST',
+                headers: {
+                    accept: 'application/json',
+                    'api-key': apiKey,
+                    'content-type': 'application/json'
                 },
-                to: [{ email: to }],
-                subject,
-                textContent: text
-            })
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(15000)
+            });
+
+            const responseText = await response.text();
+            let data = {};
+
+            try { data = responseText ? JSON.parse(responseText) : {}; }
+            catch { data = { message: responseText }; }
+
+            if (response.ok) {
+                console.log(`[MAIL] Gönderildi -> ${to} (messageId: ${data.messageId || '-'})`);
+                return data;
+            }
+
+            const detail = `Brevo HTTP ${response.status} | code=${data.code || '-'} | ${data.message || responseText}`;
+            const error = new Error(detail);
+            error.status = response.status;
+
+            // 4xx (kimlik, gönderen, IP yetkisi) tekrar denemekle düzelmez.
+            if (response.status < 500 && response.status !== 429) throw error;
+
+            lastError = error;
+        } catch (err) {
+            if (err.status && err.status < 500 && err.status !== 429) throw err;
+            lastError = err;
         }
-    );
 
-    const responseText = await response.text();
+        await new Promise(resolve => setTimeout(resolve, attempt * 800));
+    }
 
-    let data = {};
+    throw lastError || new Error('Brevo bilinmeyen hata.');
+}
+
+// Sunucu açılırken Brevo ayarlarını kontrol edip nedenini loga yazar.
+async function checkMailConfig() {
+    const apiKey = process.env.BREVO_API_KEY;
+    const sender = getMailSender();
+
+    if (!apiKey) {
+        console.warn('[MAIL-CHECK] BREVO_API_KEY tanımlı değil; e-posta gönderilemeyecek.');
+        return;
+    }
+
+    if (!sender.email) {
+        console.warn('[MAIL-CHECK] MAIL_FROM_EMAIL tanımlı değil; e-posta gönderilemeyecek.');
+        return;
+    }
+
+    const senderDomain = sender.email.split('@')[1]?.toLowerCase();
+
+    if (FREE_MAIL_DOMAINS.includes(senderDomain)) {
+        console.warn(`[MAIL-CHECK] Gönderen adres ${senderDomain} gibi ücretsiz bir servise ait. Gmail/Yahoo DMARC kuralları nedeniyle bu adresle gönderilen e-postalar çoğunlukla spam'e düşer veya hiç ulaşmaz. Kendi alan adınızda bir gönderen kullanın.`);
+    }
 
     try {
-        data = responseText
-            ? JSON.parse(responseText)
-            : {};
-    } catch {
-        data = { message: responseText };
-    }
+        const response = await fetch('https://api.brevo.com/v3/senders', {
+            headers: { accept: 'application/json', 'api-key': apiKey },
+            signal: AbortSignal.timeout(10000)
+        });
 
-    if (!response.ok) {
-        throw new Error(
-            data.message ||
-            `Brevo gönderim hatası. HTTP ${response.status}`
+        const data = await response.json().catch(() => ({}));
+
+        if (response.status === 401) {
+            console.error(`[MAIL-CHECK] Brevo 401: ${data.message || 'yetkisiz'}. API anahtarı yanlış olabilir veya Brevo > Security > Authorized IPs listesi bu sunucunun çıkış IP'sini engelliyor (Render'da IP değişkendir; "Deactivate blocking" seçeneğini kullanın).`);
+            return;
+        }
+
+        if (!response.ok) {
+            console.error(`[MAIL-CHECK] Brevo senders HTTP ${response.status}: ${data.message || ''}`);
+            return;
+        }
+
+        const found = (data.senders || []).find(
+            item => String(item.email).toLowerCase() === sender.email.toLowerCase()
         );
-    }
 
-    return data;
+        if (!found) {
+            console.error(`[MAIL-CHECK] ${sender.email} Brevo'da tanımlı gönderen DEĞİL. Brevo > Senders, Domains & Dedicated IPs bölümünden ekleyip doğrulayın.`);
+        } else if (!found.active) {
+            console.error(`[MAIL-CHECK] ${sender.email} Brevo'da var ama doğrulanmamış (aktif değil). Gelen 6 haneli kodla doğrulayın.`);
+        } else {
+            console.log(`[MAIL-CHECK] Brevo bağlantısı ve gönderen (${sender.email}) tamam.`);
+        }
+    } catch (err) {
+        console.error('[MAIL-CHECK] Brevo kontrolü yapılamadı:', err.message);
+    }
 }
 
 // =====================================================
@@ -722,7 +859,7 @@ app.get('/api/health', (req, res) => {
 
 app.post(
     '/api/auth/register',
-    rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }),
+    rateLimit({ max: 10, windowMs: 15 * 60 * 1000 }),
     async (req, res) => {
         const email = cleanEmail(req.body?.email);
 
@@ -757,10 +894,26 @@ app.post(
             );
         }
 
+        // Aynı adrese art arda kod göndermeyi engelle (60 sn).
+        const previous = db.prepare(`
+            SELECT updated_at FROM pending_registrations WHERE email = ?
+        `).get(email);
+
+        if (previous?.updated_at) {
+            const waitMs = 60000 - (Date.now() - Date.parse(previous.updated_at));
+            if (waitMs > 0) {
+                return sendError(
+                    res,
+                    429,
+                    `Yeni kod istemek için ${Math.ceil(waitMs / 1000)} saniye bekleyin.`
+                );
+            }
+        }
+
         const code = generateOtp();
 
         const expiresAt = new Date(
-            Date.now() + 5 * 60 * 1000
+            Date.now() + 10 * 60 * 1000
         ).toISOString();
 
         try {
@@ -796,7 +949,13 @@ app.post(
             await sendMail({
                 to: email,
                 subject: 'PulseTrace Pro - Hesap doğrulama kodunuz',
-                text: `PulseTrace Pro kayıt doğrulama kodunuz: ${code}. Kod 5 dakika geçerlidir.`
+                text: `PulseTrace Pro kayıt doğrulama kodunuz: ${code}. Kod 10 dakika geçerlidir.`,
+                html: buildCodeEmail(
+                    'Hesabınızı doğrulayın',
+                    'PulseTrace Pro kaydınızı tamamlamak için aşağıdaki kodu girin.',
+                    code,
+                    'Kod 10 dakika geçerlidir. Bu işlemi siz başlatmadıysanız bu e-postayı yok sayabilirsiniz.'
+                )
             });
 
             res.json({
@@ -817,6 +976,68 @@ app.post(
                 503,
                 'E-posta gönderilemedi. Lütfen daha sonra tekrar deneyin.'
             );
+        }
+    }
+);
+
+// =====================================================
+// KAYIT KODUNU TEKRAR GÖNDER
+// =====================================================
+
+app.post(
+    '/api/auth/resend-otp',
+    rateLimit({ max: 6, windowMs: 15 * 60 * 1000 }),
+    async (req, res) => {
+        const email = cleanEmail(req.body?.email);
+
+        if (!validEmail(email)) {
+            return sendError(res, 400, 'Geçerli bir e-posta girin.');
+        }
+
+        const pending = db.prepare(`
+            SELECT email, updated_at FROM pending_registrations WHERE email = ?
+        `).get(email);
+
+        if (!pending) {
+            return sendError(res, 400, 'Bekleyen kayıt bulunamadı. Lütfen baştan kayıt olun.');
+        }
+
+        const waitMs = 60000 - (Date.now() - Date.parse(pending.updated_at || 0));
+        if (waitMs > 0) {
+            return sendError(res, 429, `Yeni kod istemek için ${Math.ceil(waitMs / 1000)} saniye bekleyin.`);
+        }
+
+        const code = generateOtp();
+        const now = new Date().toISOString();
+
+        db.prepare(`
+            UPDATE pending_registrations
+            SET otp_code = ?, expires_at = ?, attempts = 0, updated_at = ?
+            WHERE email = ?
+        `).run(
+            otpHash(email, code, 'register'),
+            new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+            now,
+            email
+        );
+
+        try {
+            await sendMail({
+                to: email,
+                subject: 'PulseTrace Pro - Hesap doğrulama kodunuz',
+                text: `PulseTrace Pro kayıt doğrulama kodunuz: ${code}. Kod 10 dakika geçerlidir.`,
+                html: buildCodeEmail(
+                    'Hesabınızı doğrulayın',
+                    'PulseTrace Pro kaydınızı tamamlamak için aşağıdaki kodu girin.',
+                    code,
+                    'Kod 10 dakika geçerlidir.'
+                )
+            });
+
+            res.json({ success: true, message: 'Yeni doğrulama kodu gönderildi.' });
+        } catch (err) {
+            console.error('Resend OTP mail error:', err.message);
+            sendError(res, 503, 'E-posta gönderilemedi. Lütfen daha sonra tekrar deneyin.');
         }
     }
 );
@@ -901,9 +1122,7 @@ app.post(
                     throw new Error('DEVICE_HASH_MISSING');
                 }
                 const claimed = db.prepare('SELECT user_id FROM trial_claims WHERE device_hash = ?').get(pending.device_hash);
-                if (claimed) {
-                    throw new Error('TRIAL_ALREADY_CLAIMED');
-                }
+                const trialGranted = !claimed;
                 const result = db.prepare(`
                     INSERT INTO users (
                         email,
@@ -919,13 +1138,18 @@ app.post(
                 `).run(
                     email,
                     pending.password_hash,
-                    new Date(Date.now() + 7 * 86400000).toISOString(),
+                    // Bu cihazda deneme daha önce kullanıldıysa hesap açılır ama deneme verilmez.
+                    trialGranted
+                        ? new Date(Date.now() + 7 * 86400000).toISOString()
+                        : new Date(Date.now() - 1000).toISOString(),
                     new Date().toISOString().slice(0, 7)
                 );
 
                 const userId = Number(result.lastInsertRowid);
-                db.prepare(`INSERT INTO trial_claims (device_hash, user_id, ip_hash) VALUES (?, ?, ?)`)
-                    .run(pending.device_hash, userId, sha256(getClientIp(req) || 'unknown'));
+                if (trialGranted) {
+                    db.prepare(`INSERT INTO trial_claims (device_hash, user_id, ip_hash) VALUES (?, ?, ?)`)
+                        .run(pending.device_hash, userId, sha256(getClientIp(req) || 'unknown'));
+                }
                 const rawKey = createApiKey();
 
                 db.prepare(`
@@ -950,7 +1174,8 @@ app.post(
 
                 return {
                     id: userId,
-                    rawApiKey: rawKey
+                    rawApiKey: rawKey,
+                    trialGranted
                 };
             })();
 
@@ -967,13 +1192,16 @@ app.post(
                 email: user.email,
                 role: user.role,
                 rawApiKey: created.rawApiKey,
-                message: 'Hesabınız oluşturuldu. API anahtarını şimdi güvenli bir yere kaydedin; tekrar gösterilmez.'
+                trialGranted: created.trialGranted,
+                message: created.trialGranted
+                    ? 'Hesabınız oluşturuldu. API anahtarını şimdi güvenli bir yere kaydedin; tekrar gösterilmez.'
+                    : 'Hesabınız oluşturuldu ancak bu cihazda deneme süresi daha önce kullanılmış. Devam etmek için paket satın alın.'
             });
 
         } catch (err) {
-            if (err.message === 'TRIAL_ALREADY_CLAIMED') {
+            if (String(err.message).includes('UNIQUE constraint failed: users.email')) {
                 db.prepare('DELETE FROM pending_registrations WHERE email = ?').run(email);
-                return sendError(res, 409, 'Bu tarayıcı cihazında daha önce deneme hesabı oluşturulmuş. Mevcut hesabınıza giriş yapın.');
+                return sendError(res, 409, 'Bu e-posta adresi zaten kullanımda. Giriş yapın.');
             }
             console.error('OTP verification error:', err.message);
             sendError(res, 500, 'Hesap oluşturulamadı. Lütfen tekrar deneyin.');
@@ -1075,6 +1303,15 @@ app.post(
             });
         }
 
+        // Aynı hesaba 60 sn içinde ikinci kod gönderme (mail kotası ve spam koruması).
+        const lastRequest = db.prepare(`
+            SELECT reset_requested_at FROM users WHERE id = ?
+        `).get(user.id)?.reset_requested_at;
+
+        if (lastRequest && Date.now() - Date.parse(lastRequest) < 60000) {
+            return sendError(res, 429, 'Yeni kod istemeden önce lütfen 1 dakika bekleyin. Önceki kod hâlâ geçerli.');
+        }
+
         const code = generateOtp();
 
         const expires = new Date(
@@ -1083,11 +1320,12 @@ app.post(
 
         db.prepare(`
             UPDATE users
-            SET reset_code = ?, reset_code_expires = ?
+            SET reset_code = ?, reset_code_expires = ?, reset_attempts = 0, reset_requested_at = ?
             WHERE id = ?
         `).run(
             otpHash(email, code, 'reset'),
             expires,
+            new Date().toISOString(),
             user.id
         );
 
@@ -1095,7 +1333,13 @@ app.post(
             await sendMail({
                 to: email,
                 subject: 'PulseTrace Pro - Şifre sıfırlama kodunuz',
-                text: `Şifre sıfırlama kodunuz: ${code}. Kod 15 dakika geçerlidir.`
+                text: `Şifre sıfırlama kodunuz: ${code}. Kod 15 dakika geçerlidir.`,
+                html: buildCodeEmail(
+                    'Şifre sıfırlama',
+                    'Şifrenizi sıfırlamak için aşağıdaki kodu kullanın.',
+                    code,
+                    'Kod 15 dakika geçerlidir. Bu isteği siz yapmadıysanız bu e-postayı yok sayın; şifreniz değişmez.'
+                )
             });
 
             res.json({
@@ -1108,7 +1352,7 @@ app.post(
 
             db.prepare(`
                 UPDATE users
-                SET reset_code = NULL, reset_code_expires = NULL
+                SET reset_code = NULL, reset_code_expires = NULL, reset_requested_at = NULL
                 WHERE id = ?
             `).run(user.id);
 
@@ -1127,7 +1371,7 @@ app.post(
 
 app.post(
     '/api/auth/reset-password',
-    rateLimit({ max: 5, windowMs: 15 * 60 * 1000 }),
+    rateLimit({ max: 15, windowMs: 15 * 60 * 1000 }),
     async (req, res) => {
         const email = cleanEmail(req.body?.email);
         const code = safeString(req.body?.code, 6);
@@ -1151,7 +1395,7 @@ app.post(
         }
 
         const user = db.prepare(`
-            SELECT id, reset_code, reset_code_expires
+            SELECT id, reset_code, reset_code_expires, reset_attempts
             FROM users
             WHERE email = ?
         `).get(email);
@@ -1160,17 +1404,30 @@ app.post(
             !user ||
             !user.reset_code ||
             !user.reset_code_expires ||
-            Date.now() > Date.parse(user.reset_code_expires) ||
-            !safeEqual(
-                user.reset_code,
-                otpHash(email, code, 'reset')
-            )
+            Date.now() > Date.parse(user.reset_code_expires)
         ) {
             return sendError(
                 res,
                 400,
-                'Kod geçersiz veya süresi dolmuş.'
+                'Kod geçersiz veya süresi dolmuş. Yeni kod isteyin.'
             );
+        }
+
+        if (Number(user.reset_attempts || 0) >= 5) {
+            db.prepare(`
+                UPDATE users SET reset_code = NULL, reset_code_expires = NULL, reset_attempts = 0
+                WHERE id = ?
+            `).run(user.id);
+
+            return sendError(res, 429, 'Çok fazla hatalı deneme. Yeni sıfırlama kodu isteyin.');
+        }
+
+        if (!safeEqual(user.reset_code, otpHash(email, code, 'reset'))) {
+            db.prepare(`
+                UPDATE users SET reset_attempts = reset_attempts + 1 WHERE id = ?
+            `).run(user.id);
+
+            return sendError(res, 400, 'Kod hatalı.');
         }
 
         try {
@@ -1182,6 +1439,7 @@ app.post(
                     password_hash = ?,
                     reset_code = NULL,
                     reset_code_expires = NULL,
+                    reset_attempts = 0,
                     token_version = token_version + 1
                 WHERE id = ?
             `).run(hash, user.id);
@@ -2302,7 +2560,20 @@ const server = app.listen(PORT, () => {
 
     console.log('[PulseTrace Pro] Migration kontrolleri tamamlandı.');
     console.log('[PulseTrace Pro] PayTR ödeme modülü hazır.');
+
+    checkMailConfig();
 });
+
+// Süresi dolmuş bekleyen kayıtları saatte bir temizle.
+setInterval(() => {
+    try {
+        db.prepare(`
+            DELETE FROM pending_registrations WHERE expires_at < ?
+        `).run(new Date(Date.now() - 3600000).toISOString());
+    } catch (err) {
+        console.error('Pending cleanup error:', err.message);
+    }
+}, 3600000).unref();
 
 // =====================================================
 // GÜVENLİ KAPATMA
