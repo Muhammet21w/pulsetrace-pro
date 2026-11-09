@@ -774,6 +774,25 @@
     </div>
 </div>
 
+<!-- API KEY MODAL -->
+<div class="modal-overlay" id="apiKeyModal" style="z-index:1100;">
+    <div class="modal-content" style="width:560px;">
+        <div class="modal-header">
+            <div class="modal-title" id="apiKeyModalTitle">API Anahtarınız</div>
+        </div>
+        <div class="modal-body">
+            <p id="apiKeyModalText" style="color:var(--text-muted);font-size:12px;"></p>
+            <input type="text" id="apiKeyModalValue" readonly onclick="this.select()" style="font-family:var(--font-mono);font-size:12px;">
+            <button class="btn" id="apiKeyCopyBtn" style="width:100%;" onclick="copyApiKey()">📋 Anahtarı Kopyala</button>
+            <label style="display:flex;gap:8px;align-items:center;font-size:12px;color:var(--warning);cursor:pointer;">
+                <input type="checkbox" id="apiKeySavedCheck" onchange="document.getElementById('apiKeyCloseBtn').disabled = !this.checked" style="width:auto;margin:0;">
+                Anahtarı kopyalayıp güvenli bir yere kaydettim
+            </label>
+            <button class="btn btn-secondary" id="apiKeyCloseBtn" style="width:100%;" disabled onclick="closeApiKeyModal()">Devam Et</button>
+        </div>
+    </div>
+</div>
+
 <!-- UPGRADE / PAYMENT MODAL -->
 <div class="modal-overlay" id="upgradeModal">
     <div class="modal-content" style="width:560px;">
@@ -1108,18 +1127,16 @@ async function handleVerifyOtp() {
             alert(data.message);
         }
 
-        if (data.rawApiKey) {
-            alert(
-                `Hesabınız başarıyla oluşturuldu.\n\n` +
-                `Varsayılan proje API anahtarınız:\n${data.rawApiKey}\n\n` +
-                `Bu anahtar yalnızca bir kez gösterilir. Güvenli bir yere kaydedin.`
-            );
-        } else {
-            alert('Hesabınız başarıyla oluşturuldu.');
-        }
-
         document.getElementById('authModal').style.display = 'none';
         await init();
+
+        if (data.rawApiKey) {
+            showApiKeyModal(
+                data.rawApiKey,
+                'Hesabınız oluşturuldu 🎉',
+                'Varsayılan projenizin API anahtarı aşağıdadır. Yalnızca bir kez gösterilir; kapatmadan önce kopyalayın.'
+            );
+        }
     } catch (error) {
         showAuthMessage(error.message);
     } finally {
@@ -1294,6 +1311,46 @@ async function loadSubscriptionInfo() {
         notice.style.display = 'block';
         notice.textContent = `${data.subscriptionMessage || ''} Kalan gün: ${data.daysRemaining ?? '-'}`;
     }
+}
+
+function showApiKeyModal(key, title, text) {
+    document.getElementById('apiKeyModalTitle').textContent = title || 'API Anahtarınız';
+    document.getElementById('apiKeyModalText').textContent =
+        text || 'Bu anahtar yalnızca bir kez gösterilir. Kapatmadan önce kopyalayın.';
+    const input = document.getElementById('apiKeyModalValue');
+    input.value = key;
+    document.getElementById('apiKeySavedCheck').checked = false;
+    document.getElementById('apiKeyCloseBtn').disabled = true;
+    document.getElementById('apiKeyCopyBtn').textContent = '📋 Anahtarı Kopyala';
+    document.getElementById('apiKeyModal').style.display = 'flex';
+    input.focus();
+    input.select();
+}
+
+async function copyApiKey() {
+    const input = document.getElementById('apiKeyModalValue');
+    const button = document.getElementById('apiKeyCopyBtn');
+    let copied = false;
+
+    try {
+        await navigator.clipboard.writeText(input.value);
+        copied = true;
+    } catch {
+        input.focus();
+        input.select();
+        try { copied = document.execCommand('copy'); } catch { /* yoksay */ }
+    }
+
+    button.textContent = copied
+        ? '✔ Kopyalandı'
+        : 'Kopyalanamadı: kutuya tıklayıp Ctrl+C yapın';
+    if (copied) document.getElementById('apiKeySavedCheck').checked = true,
+        document.getElementById('apiKeyCloseBtn').disabled = false;
+}
+
+function closeApiKeyModal() {
+    document.getElementById('apiKeyModal').style.display = 'none';
+    document.getElementById('apiKeyModalValue').value = '';
 }
 
 function showSubscriptionExpired(message) {
@@ -1631,16 +1688,13 @@ async function createProject() {
 
         input.value = '';
 
+        await loadProjects();
+
         if (data.project?.apiKey) {
-            alert(
-                `Proje oluşturuldu.\n\nAPI ANAHTARI:\n${data.project.apiKey}\n\n` +
-                'Bu anahtar yalnızca bir kez gösterilir. Güvenli yere kaydedin.'
-            );
+            showApiKeyModal(data.project.apiKey, `"${name}" projesi oluşturuldu`);
         } else {
             alert('Proje oluşturuldu.');
         }
-
-        await loadProjects();
     } catch (error) {
         alert(error.message);
     }
@@ -1657,12 +1711,13 @@ async function rotateProjectKey(projectId) {
             headers: getAuthHeaders()
         });
 
-        alert(
-            `Yeni API anahtarınız:\n${data.apiKey}\n\n` +
-            'Bu anahtarı güvenli bir yere kaydedin.'
-        );
-
         await loadProjects();
+
+        showApiKeyModal(
+            data.apiKey,
+            'Yeni API anahtarınız',
+            'Eski anahtar artık geçersiz. Yeni anahtar yalnızca bir kez gösterilir; kopyalayın.'
+        );
     } catch (error) {
         alert(error.message);
     }
